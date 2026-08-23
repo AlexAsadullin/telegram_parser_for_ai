@@ -7,11 +7,12 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 
-from . import database, exporter, parser
+from . import database, dialogs, exporter, parser, transcriber
 from .models import (
     HistoryRecord,
+    ParseDMRequest,
     ParseRequest,
     ParseResponse,
     ParseStats,
@@ -66,12 +67,17 @@ async def root():
     return RedirectResponse("/docs")
 
 
-@app.post("/api/parse", response_model=ParseResponse)
-async def start_parse(req: ParseRequest):
+def _start_task(kind: str, target: str, run_parser) -> str:
+    """
+    Register a background parse task and wire it to progress/history plumbing.
+
+    `run_parser(progress_cb, stats)` performs the actual work; channels and
+    private chats differ only in that callable.
+    """
     task_id = str(uuid.uuid4())
     state = TaskState(task=None)  # type: ignore[arg-type]
     _tasks[task_id] = state
-    logger.info("[task %s] received parse request: channel=%r", task_id[:8], req.channel)
+    logger.info("[task %s] received %s request: %r", task_id[:8], kind, target)
 
     async def progress_cb(current: int, total: int, stats: ParseStats) -> None:
         state.current = current
@@ -89,12 +95,13 @@ async def start_parse(req: ParseRequest):
         )
         logger.info("[task %s] db record created: id=%s", task_id[:8], record_id)
         try:
-            result = await parser.parse_channel(req.channel, progress_cb, state.stats)
+            result = await run_parser(progress_cb, state.stats)
             await database.update_record(record_id, "completed", result.model_dump())
             state.done = True
             logger.info(
-                "[task %s] COMPLETED: channel=%r posts=%s",
-                task_id[:8], result.channel_title or result.channel_id, result.saved_posts,
+                "[task %s] COMPLETED: %r saved=%s transcribed=%s",
+                task_id[:8], result.channel_title or result.channel_id,
+                result.saved_posts, result.transcribed_count,
             )
             msg = ProgressMessage(
                 current=state.current,
@@ -116,6 +123,27 @@ async def start_parse(req: ParseRequest):
                 await q.put({"error": error_msg, "done": True})
 
     state.task = asyncio.create_task(run())
+    return task_id
+
+
+@app.post("/api/parse", response_model=ParseResponse)
+async def start_parse(req: ParseRequest):
+    task_id = _start_task(
+        "channel parse",
+        req.channel,
+        lambda cb, stats: parser.parse_channel(req.channel, cb, stats),
+    )
+    return ParseResponse(task_id=task_id)
+
+
+@app.post("/api/parse-dm", response_model=ParseResponse)
+async def start_parse_dm(req: ParseDMRequest):
+    """Parse a private chat, turning voice messages and round videos into text."""
+    task_id = _start_task(
+        "dm parse",
+        req.dialog,
+        lambda cb, stats: dialogs.parse_dialog(req.dialog, cb, stats),
+    )
     return ParseResponse(task_id=task_id)
 
 
@@ -196,5 +224,50 @@ async def export_channel(channel_id: str, transcribe: bool = False):
     filename = f"{username}_export.txt"
     return PlainTextResponse(
         content=text,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Private messages
+# ---------------------------------------------------------------------------
+
+@app.get("/api/dialogs")
+async def get_telegram_dialogs(limit: int = 100):
+    """Private chats on the account, offered as parse targets."""
+    try:
+        return await dialogs.list_telegram_dialogs(limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Не удалось получить список диалогов: {exc}")
+
+
+@app.get("/api/dms")
+async def get_parsed_dialogs():
+    """Private chats already parsed to disk."""
+    return dialogs.list_parsed_dialogs()
+
+
+@app.get("/api/asr-model")
+async def get_asr_model():
+    """Which local speech-recognition model this backend is configured to use."""
+    return transcriber.model_info()
+
+
+@app.get("/api/dms/{dialog_id}/export")
+async def export_dialog(dialog_id: str):
+    try:
+        chunks = exporter.iter_dialog_export(dialog_id)
+        first = next(chunks)  # surfaces a missing dialog before streaming starts
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    def stream():
+        yield first
+        yield from chunks
+
+    filename = f"dm_{dialog_id}_export.txt"
+    return StreamingResponse(
+        stream(),
+        media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

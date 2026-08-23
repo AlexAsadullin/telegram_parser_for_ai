@@ -20,15 +20,20 @@ async def init_db() -> None:
                 voice_count INTEGER DEFAULT 0,
                 files_count INTEGER DEFAULT 0,
                 links_count INTEGER DEFAULT 0,
+                transcribed_count INTEGER DEFAULT 0,
                 status TEXT CHECK(status IN ('completed', 'failed', 'in_progress')),
                 error_message TEXT
             )
         """)
-        # Migration for older DBs that lack error_message column
-        try:
-            await db.execute("ALTER TABLE parse_history ADD COLUMN error_message TEXT")
-        except aiosqlite.OperationalError:
-            pass  # column already exists
+        # Migrations for older DBs that lack newer columns
+        for column, ddl in (
+            ("error_message", "ALTER TABLE parse_history ADD COLUMN error_message TEXT"),
+            ("transcribed_count", "ALTER TABLE parse_history ADD COLUMN transcribed_count INTEGER DEFAULT 0"),
+        ):
+            try:
+                await db.execute(ddl)
+            except aiosqlite.OperationalError:
+                pass  # column already exists
         await db.commit()
 
 
@@ -67,6 +72,7 @@ async def update_record(
                 voice_count = ?,
                 files_count = ?,
                 links_count = ?,
+                transcribed_count = ?,
                 error_message = ?
             WHERE id = ?
             """,
@@ -83,6 +89,7 @@ async def update_record(
                 stats.get("voice_count", 0),
                 stats.get("files_count", 0),
                 stats.get("links_count", 0),
+                stats.get("transcribed_count", 0),
                 error_message,
                 record_id,
             ),

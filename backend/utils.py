@@ -3,7 +3,7 @@ import re
 
 from telethon import TelegramClient
 from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import Channel, Chat, ChatInviteAlready
+from telethon.tl.types import Channel, Chat, ChatInviteAlready, User
 
 logger = logging.getLogger(__name__)
 
@@ -97,5 +97,76 @@ async def resolve_channel(client: TelegramClient, raw: str):
     logger.info(
         "Channel resolved: id=%s title=%r username=%r",
         entity.id, getattr(entity, "title", "?"), getattr(entity, "username", None),
+    )
+    return entity
+
+
+async def start_client(client: TelegramClient) -> TelegramClient:
+    """
+    Connect using the stored session.
+
+    Deliberately not client.start(): that falls back to prompting for a phone
+    number on stdin, which under uvicorn surfaces as a bare EOFError. Fail with
+    an instruction instead.
+    """
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise ValueError(
+            "Telegram-сессия не авторизована. Выполните один раз из корня проекта: "
+            "python -m backend.login — и введите номер телефона и код из Telegram."
+        )
+    return client
+
+
+def display_name(user) -> str:
+    """Human-readable name for a Telegram user."""
+    parts = [getattr(user, "first_name", None), getattr(user, "last_name", None)]
+    name = " ".join(p for p in parts if p).strip()
+    if name:
+        return name
+    username = getattr(user, "username", None)
+    return f"@{username}" if username else str(getattr(user, "id", "?"))
+
+
+async def resolve_dialog(client: TelegramClient, raw: str):
+    """
+    Return a Telethon User entity for a private chat.
+
+    Supported formats:
+      - @username  /  username
+      - https://t.me/username
+      - numeric user id
+      - 'me' / 'saved'  (Saved Messages)
+    """
+    raw = raw.strip()
+
+    if raw.lower() in ("me", "saved", "избранное"):
+        me = await client.get_me()
+        logger.info("Dialog resolved to Saved Messages: id=%s", me.id)
+        return me
+
+    identifier = parse_channel_input(raw)  # same normalisation rules apply
+    logger.info("Resolving dialog: input=%r → identifier=%r", raw, identifier)
+
+    try:
+        entity = await client.get_entity(identifier)
+    except Exception as exc:
+        logger.error("get_entity failed for %r: %s", identifier, exc)
+        raise ValueError(
+            f"Не удалось найти собеседника '{raw}': {exc}. "
+            f"Для личных сообщений нужен @username или числовой ID пользователя."
+        )
+
+    if not isinstance(entity, User):
+        type_name = type(entity).__name__
+        logger.error("Resolved entity is %s, not a User", type_name)
+        raise ValueError(
+            f"'{raw}' — это {type_name}, а не пользователь. "
+            f"Для каналов и групп используйте обычное скачивание канала."
+        )
+
+    logger.info(
+        "Dialog resolved: id=%s name=%r username=%r",
+        entity.id, display_name(entity), getattr(entity, "username", None),
     )
     return entity

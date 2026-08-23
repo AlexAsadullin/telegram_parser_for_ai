@@ -5,6 +5,10 @@ class ParseRequest(BaseModel):
     channel: str
 
 
+class ParseDMRequest(BaseModel):
+    dialog: str
+
+
 class ParseStats(BaseModel):
     channel_id: str = ""
     channel_username: str = ""
@@ -17,6 +21,8 @@ class ParseStats(BaseModel):
     voice_count: int = 0
     files_count: int = 0
     links_count: int = 0
+    # DM parsing only: voice messages and round video notes turned into text
+    transcribed_count: int = 0
 
 
 class ProgressMessage(BaseModel):
@@ -45,5 +51,6 @@ class HistoryRecord(BaseModel):
     voice_count: int
     files_count: int
     links_count: int
+    transcribed_count: int = 0
     status: str
     error_message: str | None = None

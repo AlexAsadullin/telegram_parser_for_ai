@@ -1,9 +1,12 @@
 """
-Export downloaded channel data to a single LLM-friendly text file.
-Optionally transcribes voice messages via the Telegram API (requires Premium).
+Export downloaded data to a single LLM-friendly text file.
 
-Run from the backend/ directory:
-    uvicorn main:app --reload
+Channels: posts only, optionally transcribing voice via the Telegram API
+(requires Premium). Private messages: text plus locally recognised voice and
+round video notes, already merged into one chronological transcript.
+
+Run from the project root:
+    uvicorn backend.main:app --reload
 """
 import asyncio
 import json
@@ -11,8 +14,9 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient
 
+from . import dialogs
 from .config import API_HASH, API_ID, DATA_DIR, SESSION_PATH
-from .utils import resolve_channel
+from .utils import resolve_channel, start_client
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +30,7 @@ def list_channels() -> list[dict]:
         return channels
 
     for channel_dir in sorted(DATA_DIR.iterdir()):
-        if not channel_dir.is_dir():
+        if not channel_dir.is_dir() or channel_dir.name.startswith("dm_"):
             continue
         info_path = channel_dir / "info.json"
         posts_path = channel_dir / "posts.json"
@@ -184,7 +188,7 @@ async def export_channel_text(channel_id: str, transcribe: bool = False) -> str:
         ]
         if voice_items:
             client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-            await client.start()
+            await start_client(client)
             try:
                 peer = await resolve_channel(client, channel_ref or str(info.get("id", "")))
                 for ts, entry in voice_items:
@@ -201,3 +205,82 @@ async def export_channel_text(channel_id: str, transcribe: bool = False) -> str:
 
     body = "\n\n".join(post_blocks)
     return f"{header}\n\n{body}\n\n{sep}\n"
+
+
+# ---------------------------------------------------------------------------
+# Private-message export
+# ---------------------------------------------------------------------------
+
+_KIND_LABEL = {
+    "voice": "голосовое",
+    "video_note": "кружок",
+}
+
+
+def _format_dm_entry(entry: dict, me_label: str, peer_label: str) -> str:
+    """
+    One line of the transcript.
+
+    Typed text and recognised speech are rendered the same way — only a small
+    marker says where the text came from, so the chat reads as one sequence.
+    """
+    who = me_label if entry.get("outgoing") else peer_label
+    stamp = (entry.get("date") or "").replace("T", " ")
+
+    marker = ""
+    kind = entry.get("kind")
+    if kind in _KIND_LABEL:
+        label = _KIND_LABEL[kind]
+        duration = entry.get("duration")
+        if duration:
+            label = f"{label}, {duration}с"
+        marker = f" [{label}{'' if entry.get('transcribed') else ', не распознано'}]"
+
+    text = (entry.get("text") or "").strip() or "—"
+    return f"[{stamp}] {who}{marker}: {text}"
+
+
+def iter_dialog_export(dialog_id: str):
+    """
+    Yield an LLM-friendly transcript of a parsed private chat, piece by piece.
+
+    Messages come out oldest → newest, the order a conversation is read in.
+    The file is walked twice — once to count for the header, once to format —
+    so no more than one message is ever held in memory, however long the chat.
+    """
+    out_dir = dialogs.dialog_dir(dialog_id)
+    info_path = out_dir / dialogs.INFO_FILE
+    messages_path = out_dir / dialogs.MESSAGES_FILE
+
+    if not info_path.exists() or not messages_path.exists():
+        raise FileNotFoundError(f"Dialog data not found for id={dialog_id}")
+
+    with info_path.open(encoding="utf-8") as f:
+        info = json.load(f)
+
+    peer_label = info.get("title") or dialog_id
+    me_label = "Я"
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    total = 0
+    transcribed = 0
+    for entry in dialogs.iter_messages(messages_path):
+        total += 1
+        if entry.get("transcribed"):
+            transcribed += 1
+
+    sep = "─" * 60
+    username = info.get("username", "")
+    yield "\n".join([
+        sep,
+        f"ЛИЧНЫЙ ЧАТ: {peer_label}" + (f" (@{username})" if username else ""),
+        f"ЭКСПОРТ: {exported_at} | СООБЩЕНИЙ: {total} | РАСПОЗНАНО ГОЛОСОМ: {transcribed}",
+        sep,
+        "",
+        "",
+    ])
+
+    for entry in dialogs.iter_messages(messages_path):
+        yield _format_dm_entry(entry, me_label, peer_label) + "\n"
+
+    yield f"\n{sep}\n"

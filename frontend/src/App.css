@@ -429,3 +429,121 @@ body {
   background: #4c1d95;
   color: #fff;
 }
+
+/* ── Private messages ─────────────────────────────────────────────── */
+
+.nav-group {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+/* Channel / DM switch above the input */
+.source-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 20px;
+  padding: 4px;
+  background: #151b28;
+  border: 1px solid #1e2a3a;
+  border-radius: 10px;
+}
+
+.source-tab {
+  flex: 1;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  background: transparent;
+  color: #64748b;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.source-tab:hover {
+  color: #93c5fd;
+}
+
+.source-tab--active {
+  background: #1e3a5f;
+  color: #93c5fd;
+}
+
+.dm-hint {
+  margin: 14px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #64748b;
+}
+
+.progress-note {
+  margin: 16px 0 0;
+  font-size: 13px;
+  color: #a78bfa;
+}
+
+/* Picker listing the account's private chats */
+.dm-picker {
+  margin-top: 28px;
+}
+
+.dm-picker h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #64748b;
+}
+
+.dm-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.dm-picker-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 14px;
+  text-align: left;
+  background: #151b28;
+  border: 1px solid #1e2a3a;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.dm-picker-item:hover:not(:disabled) {
+  background: #1a2235;
+  border-color: #3b82f6;
+}
+
+.dm-picker-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dm-picker-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: #e2e8f0;
+}
+
+.dm-picker-meta {
+  font-size: 12px;
+  color: #4a5568;
+}
+
+.dm-parsed-badge {
+  padding: 2px 7px;
+  font-size: 11px;
+  color: #a78bfa;
+  background: #1e1b32;
+  border-radius: 4px;
+}

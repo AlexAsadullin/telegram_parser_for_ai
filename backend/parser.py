@@ -20,7 +20,7 @@ from telethon.tl.types import (
 
 from .config import API_HASH, API_ID, DATA_DIR, SESSION_PATH
 from .models import ParseStats
-from .utils import resolve_channel
+from .utils import resolve_channel, start_client
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ async def parse_channel(
 ) -> ParseStats:
     logger.info("=== Starting parse for input: %r ===", channel_input)
     client = _make_client()
-    await client.start()
+    await start_client(client)
     logger.info("Telegram client connected")
 
     try:

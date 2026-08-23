@@ -5,3 +5,8 @@ python-dotenv==1.2.3
 aiosqlite==0.22.1
 aiofiles==25.1.0
 pydantic==2.13.4
+
+# Local speech recognition for private messages (voice + round video notes).
+# Pulls in ctranslate2, av (PyAV), tokenizers, onnxruntime and numpy.
+# PyAV also decodes the audio track of .mp4 video notes, so no ffmpeg needed.
+faster-whisper==1.2.1
