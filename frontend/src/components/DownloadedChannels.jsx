@@ -13,17 +13,19 @@ export default function DownloadedChannels({ onBack }) {
       .finally(() => setLoading(false))
   }, [])
 
-  const handleExport = async (channelId, transcribe) => {
+  const handleExport = async (channelId, { transcribe = false, format = 'md' } = {}) => {
     const key = channelId
-    setExporting((prev) => ({ ...prev, [key]: transcribe ? 'transcribe' : 'plain' }))
+    setExporting((prev) => ({
+      ...prev, [key]: transcribe ? 'transcribe' : format,
+    }))
 
     try {
-      const url = `/api/channels/${channelId}/export?transcribe=${transcribe}`
+      const url = `/api/channels/${channelId}/export?transcribe=${transcribe}&format=${format}`
       // trigger browser file download
       const res = await axios.get(url, { responseType: 'blob' })
       const disposition = res.headers['content-disposition'] || ''
       const match = disposition.match(/filename="([^"]+)"/)
-      const filename = match ? match[1] : `${channelId}_export.txt`
+      const filename = match ? match[1] : `${channelId}_export.${format}`
 
       const blobUrl = URL.createObjectURL(res.data)
       const a = document.createElement('a')
@@ -80,19 +82,28 @@ export default function DownloadedChannels({ onBack }) {
                   <button
                     className="export-btn"
                     disabled={!!busy}
-                    onClick={() => handleExport(ch.channel_id, false)}
+                    onClick={() => handleExport(ch.channel_id, { format: 'md' })}
                   >
-                    {busy === 'plain' ? 'Экспорт...' : 'Выгрузить текст'}
+                    {busy === 'md' ? 'Экспорт...' : 'Выгрузить для ИИ (.md)'}
+                  </button>
+
+                  <button
+                    className="export-btn export-btn--secondary"
+                    disabled={!!busy}
+                    onClick={() => handleExport(ch.channel_id, { format: 'txt' })}
+                    title="Простой текстовый файл"
+                  >
+                    {busy === 'txt' ? 'Экспорт...' : '.txt'}
                   </button>
 
                   {ch.voice_count > 0 && (
                     <button
                       className="export-btn export-btn--transcribe"
                       disabled={!!busy}
-                      onClick={() => handleExport(ch.channel_id, true)}
+                      onClick={() => handleExport(ch.channel_id, { transcribe: true })}
                       title="Требуется Telegram Premium"
                     >
-                      {busy === 'transcribe' ? 'Транскрибация...' : 'Текст + транскрипция'}
+                      {busy === 'transcribe' ? 'Транскрибация...' : '.md + транскрипция'}
                     </button>
                   )}
                 </div>

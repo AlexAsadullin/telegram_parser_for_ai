@@ -137,6 +137,54 @@ def _format_post(timestamp: str, entry: dict, transcription: str | None = None) 
 # Main export function
 # ---------------------------------------------------------------------------
 
+async def channel_transcriptions_for(channel_id: str, transcribe: bool) -> dict[str, str]:
+    """Transcriptions for a channel by id, or {} when not requested."""
+    if not transcribe:
+        return {}
+
+    channel_dir = DATA_DIR / str(channel_id)
+    info_path = channel_dir / "info.json"
+    posts_path = channel_dir / "posts.json"
+    if not info_path.exists() or not posts_path.exists():
+        raise FileNotFoundError(f"Channel data not found for id={channel_id}")
+
+    with info_path.open(encoding="utf-8") as f:
+        info = json.load(f)
+    with posts_path.open(encoding="utf-8") as f:
+        posts = json.load(f)
+
+    username = info.get("username", "")
+    channel_ref = f"@{username}" if username else str(channel_id)
+    return await collect_channel_transcriptions(sorted(posts.items()), channel_ref, info)
+
+
+async def collect_channel_transcriptions(items, channel_ref: str, info: dict) -> dict[str, str]:
+    """
+    Transcribe a channel's voice posts via Telegram (Premium only).
+
+    Shared by the .txt and .md exports, keyed by post timestamp.
+    """
+    voice_items = [
+        (ts, entry) for ts, entry in items
+        if entry.get("voice") and entry.get("message_id")
+    ]
+    if not voice_items:
+        return {}
+
+    transcriptions: dict[str, str] = {}
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+    await start_client(client)
+    try:
+        peer = await resolve_channel(client, channel_ref or str(info.get("id", "")))
+        for ts, entry in voice_items:
+            result = await _transcribe_voice(client, peer, entry["message_id"])
+            if result:
+                transcriptions[ts] = result
+    finally:
+        await client.disconnect()
+    return transcriptions
+
+
 async def export_channel_text(channel_id: str, transcribe: bool = False) -> str:
     """
     Generate a single LLM-friendly text export of all posts in a channel.
@@ -180,23 +228,9 @@ async def export_channel_text(channel_id: str, transcribe: bool = False) -> str:
 
     sorted_items = sorted(posts.items(), reverse=True)
 
-    transcriptions: dict[str, str] = {}
-    if transcribe:
-        voice_items = [
-            (ts, entry) for ts, entry in sorted_items
-            if entry.get("voice") and entry.get("message_id")
-        ]
-        if voice_items:
-            client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-            await start_client(client)
-            try:
-                peer = await resolve_channel(client, channel_ref or str(info.get("id", "")))
-                for ts, entry in voice_items:
-                    result = await _transcribe_voice(client, peer, entry["message_id"])
-                    if result:
-                        transcriptions[ts] = result
-            finally:
-                await client.disconnect()
+    transcriptions = await collect_channel_transcriptions(
+        sorted_items, channel_ref, info
+    ) if transcribe else {}
 
     post_blocks = [
         _format_post(ts, entry, transcriptions.get(ts))

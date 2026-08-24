@@ -40,6 +40,9 @@ class ParseStats(BaseModel):
     # message counter (one 5-minute voice note outweighs 200 texts).
     voice_seconds: int = 0
     transcribed_seconds: int = 0
+    # Media already downloaded and waiting for the recogniser. Non-zero means
+    # the download and recognition stages are genuinely overlapping.
+    queued_media: int = 0
 
 
 class ProgressMessage(BaseModel):

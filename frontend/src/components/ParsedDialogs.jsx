@@ -15,13 +15,15 @@ export default function ParsedDialogs({ onBack }) {
     return () => { cancelled = true }
   }, [])
 
-  const handleExport = async (dialogId) => {
-    setExporting((prev) => ({ ...prev, [dialogId]: true }))
+  const handleExport = async (dialogId, format) => {
+    setExporting((prev) => ({ ...prev, [dialogId]: format }))
     try {
-      const res = await axios.get(`/api/dms/${dialogId}/export`, { responseType: 'blob' })
+      const res = await axios.get(`/api/dms/${dialogId}/export?format=${format}`, {
+        responseType: 'blob',
+      })
       const disposition = res.headers['content-disposition'] || ''
       const match = disposition.match(/filename="([^"]+)"/)
-      const filename = match ? match[1] : `dm_${dialogId}_export.txt`
+      const filename = match ? match[1] : `dm_${dialogId}_export.${format}`
 
       const blobUrl = URL.createObjectURL(res.data)
       const a = document.createElement('a')
@@ -32,7 +34,7 @@ export default function ParsedDialogs({ onBack }) {
     } catch {
       alert('Ошибка при экспорте')
     } finally {
-      setExporting((prev) => ({ ...prev, [dialogId]: false }))
+      setExporting((prev) => ({ ...prev, [dialogId]: null }))
     }
   }
 
@@ -48,6 +50,14 @@ export default function ParsedDialogs({ onBack }) {
       {!loading && dialogs.length === 0 && (
         <p className="history-empty">
           Нет скачанных переписок. Выберите чат на главном экране во вкладке «Личные сообщения».
+        </p>
+      )}
+
+      {!loading && dialogs.length > 0 && (
+        <p className="export-hint">
+          <strong>Выгрузить для ИИ (.md)</strong> — один файл, который можно целиком
+          отдать ассистенту: внутри есть пояснение, кто с кем говорит и какие реплики
+          были голосовыми. <strong>.txt</strong> — тот же диалог без разметки.
         </p>
       )}
 
@@ -72,9 +82,19 @@ export default function ParsedDialogs({ onBack }) {
                 <button
                   className="export-btn"
                   disabled={!!exporting[d.dialog_id]}
-                  onClick={() => handleExport(d.dialog_id)}
+                  onClick={() => handleExport(d.dialog_id, 'md')}
+                  title="Markdown с описанием диалога — готов к отправке в ИИ"
                 >
-                  {exporting[d.dialog_id] ? 'Экспорт...' : 'Выгрузить текст'}
+                  {exporting[d.dialog_id] === 'md' ? 'Экспорт...' : 'Выгрузить для ИИ (.md)'}
+                </button>
+
+                <button
+                  className="export-btn export-btn--secondary"
+                  disabled={!!exporting[d.dialog_id]}
+                  onClick={() => handleExport(d.dialog_id, 'txt')}
+                  title="Простой текстовый файл"
+                >
+                  {exporting[d.dialog_id] === 'txt' ? 'Экспорт...' : '.txt'}
                 </button>
               </div>
             </div>

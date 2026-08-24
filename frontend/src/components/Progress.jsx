@@ -69,6 +69,11 @@ export default function Progress({ data, mode = 'channel', onStop, stopping }) {
           <div className="speech-split">
             <span>Голосовых: <strong>{stats.voice_count || 0}</strong></span>
             <span>Кружков: <strong>{stats.videos_count || 0}</strong></span>
+            {stats.queued_media > 0 && (
+              <span className="queue-badge" title="Скачано заранее и ждёт распознавания">
+                в очереди: <strong>{stats.queued_media}</strong>
+              </span>
+            )}
           </div>
         </div>
       )}

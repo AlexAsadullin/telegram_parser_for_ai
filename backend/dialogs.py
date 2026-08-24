@@ -45,6 +45,10 @@ INFO_FILE = "info.json"
 # update, so the counter only throttles the cheap ones.
 TEXT_PROGRESS_EVERY = 10
 
+# How many media files may be fetched at once, ahead of the recogniser.
+# Bounds both open connections and how far the prefetch may run ahead.
+DOWNLOAD_CONCURRENCY = 4
+
 _KIND_RU = {"voice": "голосовое", "video_note": "кружок"}
 
 
@@ -108,6 +112,34 @@ def _duration(message) -> int | None:
 # Parsing
 # ---------------------------------------------------------------------------
 
+async def _download_media(
+    client: TelegramClient,
+    message,
+    tmp_dir: Path,
+    sem: asyncio.Semaphore,
+    stats: ParseStats,
+) -> str | None:
+    """
+    Fetch one voice/round file. Runs ahead of transcription, several at a time.
+
+    The semaphore is what keeps "ahead" bounded: without it a chunk of 200
+    messages would open 200 simultaneous downloads.
+    """
+    async with sem:
+        try:
+            path = await client.download_media(message.media, file=str(tmp_dir) + "/")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Media download failed for msg %s: %s", message.id, exc)
+            return None
+    if path:
+        # Downloaded and waiting for the recogniser — this is the queue depth
+        # the UI shows, and the proof that the two stages overlap.
+        stats.queued_media += 1
+    return path
+
+
 async def _process_message(
     client: TelegramClient,
     message,
@@ -115,13 +147,19 @@ async def _process_message(
     me_id: int,
     stats: ParseStats,
     report=None,
+    download=None,
 ) -> dict | None:
     """
     Turn one message into a transcript entry, or None if it carries nothing.
 
-    Voice messages and round video notes are downloaded into tmp_dir and
-    transcribed; their recognised text lands in the same `text` field a typed
-    message uses, which is what keeps the transcript a single sequence.
+    Voice messages and round video notes are transcribed; their recognised text
+    lands in the same `text` field a typed message uses, which is what keeps the
+    transcript a single sequence.
+
+    `download` is the task started for this message earlier by the caller, so by
+    the time we get here the file is usually already on disk and only the
+    recognition remains. Messages are still consumed strictly in order, which is
+    what keeps the output chronological.
 
     `report(stage, detail)` is awaited around the slow steps so the UI can say
     which message is being downloaded or recognised instead of sitting still.
@@ -152,12 +190,14 @@ async def _process_message(
         stats.voice_seconds += duration
 
         media_path = None
-        try:
-            if report:
-                await report("downloading", f"скачиваю {described}")
-            media_path = await client.download_media(message.media, file=str(tmp_dir) + "/")
-        except Exception as exc:
-            logger.warning("Media download failed for msg %s: %s", message.id, exc)
+        if download is not None:
+            # Only announce a wait if there is actually one: usually the
+            # prefetch finished while an earlier message was being recognised.
+            if not download.done() and report:
+                await report("downloading", f"жду загрузку: {described}")
+            media_path = await download
+            if media_path:
+                stats.queued_media = max(0, stats.queued_media - 1)
 
         if media_path:
             if report:
@@ -235,33 +275,55 @@ async def parse_dialog(
         # Truncate any previous run before streaming this one in.
         with messages_path.open("w", encoding="utf-8") as sink:
 
+            sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
             async def flush(chunk_messages: list) -> None:
                 """Process one chunk end to end, then let it go out of scope."""
                 nonlocal current
-                for msg in chunk_messages:
-                    current += 1
 
-                    async def report(stage: str, detail: str) -> None:
-                        await progress_cb(current, total, stats_out,
-                                          stage=stage, detail=detail)
-
-                    entry = await _process_message(
-                        client, msg, tmp_dir, me.id, stats_out, report=report
+                # Start every download in this chunk up front. Downloading is
+                # network-bound and recognition is compute-bound, so they run at
+                # the same time: while the model works on one voice message, the
+                # next ones are already arriving.
+                downloads = {
+                    msg.id: asyncio.create_task(
+                        _download_media(client, msg, tmp_dir, sem, stats_out)
                     )
-                    stats_out.total_posts += 1
-                    if entry is None:
-                        stats_out.skipped_posts += 1
-                    else:
-                        sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                        stats_out.saved_posts += 1
+                    for msg in chunk_messages
+                    if _voice_kind(msg)
+                }
 
-                    # Media messages already reported themselves; text is cheap
-                    # enough that a periodic tick is plenty.
-                    if entry is not None and entry["kind"] != "text":
-                        sink.flush()
-                        await progress_cb(current, total, stats_out, stage="scanning")
-                    elif current % TEXT_PROGRESS_EVERY == 0:
-                        await progress_cb(current, total, stats_out, stage="scanning")
+                try:
+                    for msg in chunk_messages:
+                        current += 1
+
+                        async def report(stage: str, detail: str) -> None:
+                            await progress_cb(current, total, stats_out,
+                                              stage=stage, detail=detail)
+
+                        entry = await _process_message(
+                            client, msg, tmp_dir, me.id, stats_out,
+                            report=report, download=downloads.get(msg.id),
+                        )
+                        stats_out.total_posts += 1
+                        if entry is None:
+                            stats_out.skipped_posts += 1
+                        else:
+                            sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                            stats_out.saved_posts += 1
+
+                        # Media messages already reported themselves; text is
+                        # cheap enough that a periodic tick is plenty.
+                        if entry is not None and entry["kind"] != "text":
+                            sink.flush()
+                            await progress_cb(current, total, stats_out, stage="scanning")
+                        elif current % TEXT_PROGRESS_EVERY == 0:
+                            await progress_cb(current, total, stats_out, stage="scanning")
+                finally:
+                    # On cancellation the prefetch must not outlive the run.
+                    for task in downloads.values():
+                        if not task.done():
+                            task.cancel()
 
                 sink.flush()
                 await progress_cb(current, total, stats_out, stage="scanning")

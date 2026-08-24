@@ -840,3 +840,40 @@ body {
 .status-stopped {
   color: #fcd34d;
 }
+
+/* Media downloaded ahead of the recogniser — visible proof the pipeline overlaps */
+.queue-badge {
+  color: #38bdf8;
+}
+
+.queue-badge strong {
+  color: #7dd3fc;
+}
+
+/* Secondary export format (plain .txt next to the primary .md) */
+.export-btn--secondary {
+  background: #151b28;
+  color: #64748b;
+  border-color: #2d3f55;
+}
+
+.export-btn--secondary:hover:not(:disabled) {
+  color: #93c5fd;
+  border-color: #3b82f6;
+}
+
+.export-hint {
+  margin: 0 0 20px;
+  padding: 12px 16px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #94a3b8;
+  background: #151b28;
+  border: 1px solid #1e2a3a;
+  border-radius: 8px;
+}
+
+.export-hint strong {
+  color: #93c5fd;
+  font-weight: 500;
+}

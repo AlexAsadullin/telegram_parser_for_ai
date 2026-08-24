@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 
-from . import auth, database, dialogs, exporter, parser, transcriber
+from . import auth, database, dialogs, exporter, md_export, parser, transcriber
 from .models import (
     AuthCodeRequest,
     AuthPasswordRequest,
@@ -330,23 +330,50 @@ async def get_channels():
     return exporter.list_channels()
 
 
-@app.get("/api/channels/{channel_id}/export")
-async def export_channel(channel_id: str, transcribe: bool = False):
-    try:
-        text = await exporter.export_channel_text(channel_id, transcribe=transcribe)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+def _download_headers(filename: str) -> dict:
+    return {"Content-Disposition": f'attachment; filename="{filename}"'}
 
+
+@app.get("/api/channels/{channel_id}/export")
+async def export_channel(channel_id: str, transcribe: bool = False, format: str = "md"):
+    """
+    Export a channel as Markdown (default) or plain text.
+
+    Markdown is the format meant to be handed to an assistant: it carries its
+    own header explaining what the document is and how to read it.
+    """
     username = channel_id
     for ch in exporter.list_channels():
         if ch["channel_id"] == channel_id:
             username = ch["username"] or channel_id
             break
 
-    filename = f"{username}_export.txt"
-    return PlainTextResponse(
-        content=text,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    if format == "txt":
+        try:
+            text = await exporter.export_channel_text(channel_id, transcribe=transcribe)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return PlainTextResponse(
+            content=text, headers=_download_headers(f"{username}_export.txt"),
+        )
+
+    try:
+        transcriptions = await exporter.channel_transcriptions_for(
+            channel_id, transcribe=transcribe,
+        )
+        chunks = md_export.iter_channel_markdown(channel_id, transcriptions)
+        first = next(chunks)  # surfaces a missing channel before streaming starts
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    def stream():
+        yield first
+        yield from chunks
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/markdown; charset=utf-8",
+        headers=_download_headers(f"{username}_export.md"),
     )
 
 
@@ -376,9 +403,19 @@ async def get_asr_model():
 
 
 @app.get("/api/dms/{dialog_id}/export")
-async def export_dialog(dialog_id: str):
+async def export_dialog(dialog_id: str, format: str = "md"):
+    """
+    Export a private chat as Markdown (default) or plain text.
+
+    Markdown is the format meant to be handed to an assistant: it names both
+    participants and explains that voice text came from speech recognition.
+    """
+    as_md = format != "txt"
     try:
-        chunks = exporter.iter_dialog_export(dialog_id)
+        chunks = (
+            md_export.iter_dialog_markdown(dialog_id) if as_md
+            else exporter.iter_dialog_export(dialog_id)
+        )
         first = next(chunks)  # surfaces a missing dialog before streaming starts
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -387,9 +424,9 @@ async def export_dialog(dialog_id: str):
         yield first
         yield from chunks
 
-    filename = f"dm_{dialog_id}_export.txt"
+    suffix = "md" if as_md else "txt"
     return StreamingResponse(
         stream(),
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        media_type=f"text/{'markdown' if as_md else 'plain'}; charset=utf-8",
+        headers=_download_headers(f"dm_{dialog_id}_export.{suffix}"),
     )
