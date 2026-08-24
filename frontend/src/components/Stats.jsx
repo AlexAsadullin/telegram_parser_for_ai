@@ -3,6 +3,12 @@ export default function Stats({ stats, onReset, mode = 'channel' }) {
 
   const isDm = mode === 'dm'
 
+  const clock = (seconds) => {
+    const m = Math.floor((seconds || 0) / 60)
+    const s = Math.floor((seconds || 0) % 60)
+    return `${m}:${String(s).padStart(2, '0')}`
+  }
+
   const rows = isDm
     ? [
         ['Собеседник', stats.channel_title || stats.channel_username || stats.channel_id],
@@ -12,7 +18,8 @@ export default function Stats({ stats, onReset, mode = 'channel' }) {
         ['Пропущено', stats.skipped_posts],
         ['Голосовые', stats.voice_count],
         ['Кружки', stats.videos_count],
-        ['Распознано речью', stats.transcribed_count],
+        ['Распознано речью', `${stats.transcribed_count} из ${(stats.voice_count || 0) + (stats.videos_count || 0)}`],
+        ['Длительность речи', `${clock(stats.transcribed_seconds)} из ${clock(stats.voice_seconds)}`],
       ]
     : [
         ['Канал', stats.channel_title || stats.channel_username || stats.channel_id],

@@ -35,10 +35,23 @@ from .utils import display_name, resolve_dialog, start_client
 
 logger = logging.getLogger(__name__)
 
-ProgressCallback = Callable[[int, int, ParseStats], Awaitable[None]]
+ProgressCallback = Callable[..., Awaitable[None]]
 
 MESSAGES_FILE = "messages.jsonl"
 INFO_FILE = "info.json"
+
+# Plain text messages fly by; media messages are slow and each one deserves an
+# update, so the counter only throttles the cheap ones.
+TEXT_PROGRESS_EVERY = 10
+
+_KIND_RU = {"voice": "голосовое", "video_note": "кружок"}
+
+
+def _clock(seconds: int | None) -> str:
+    """Format a duration the way a chat client shows it: 0:07, 2:31."""
+    if not seconds:
+        return ""
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def dialog_dir(dialog_id: str | int) -> Path:
@@ -90,6 +103,7 @@ async def _process_message(
     tmp_dir: Path,
     me_id: int,
     stats: ParseStats,
+    report=None,
 ) -> dict | None:
     """
     Turn one message into a transcript entry, or None if it carries nothing.
@@ -97,6 +111,9 @@ async def _process_message(
     Voice messages and round video notes are downloaded into tmp_dir and
     transcribed; their recognised text lands in the same `text` field a typed
     message uses, which is what keeps the transcript a single sequence.
+
+    `report(stage, detail)` is awaited around the slow steps so the UI can say
+    which message is being downloaded or recognised instead of sitting still.
     """
     if isinstance(message, MessageService):
         return None
@@ -112,17 +129,28 @@ async def _process_message(
     else:
         entry_kind = kind
         transcribed = False
+        label = _KIND_RU[kind]
+        duration = _duration(message) or 0
+        stamp = _clock(duration)
+        described = f"{label} {stamp}".strip()
+
+        if kind == "voice":
+            stats.voice_count += 1
+        else:
+            stats.videos_count += 1
+        stats.voice_seconds += duration
+
         media_path = None
         try:
+            if report:
+                await report("downloading", f"скачиваю {described}")
             media_path = await client.download_media(message.media, file=str(tmp_dir) + "/")
         except Exception as exc:
             logger.warning("Media download failed for msg %s: %s", message.id, exc)
 
         if media_path:
-            if kind == "voice":
-                stats.voice_count += 1
-            else:
-                stats.videos_count += 1
+            if report:
+                await report("transcribing", f"распознаю {described}")
             # For a round video note this reads the audio stream out of the
             # .mp4 directly — the video itself is never needed.
             recognised = await transcriber.transcribe(Path(media_path))
@@ -130,6 +158,7 @@ async def _process_message(
                 text = f"{text}\n{recognised}".strip() if text else recognised
                 transcribed = True
                 stats.transcribed_count += 1
+                stats.transcribed_seconds += duration
 
     return {
         "message_id": message.id,
@@ -180,6 +209,12 @@ async def parse_dialog(
         total = (await client.get_messages(entity, limit=0)).total
         logger.info("Dialog %r: %s messages reported by Telegram", name, total)
 
+        # Pay the model load now, while the UI already shows progress, instead
+        # of stalling on the first voice message.
+        await progress_cb(0, total, stats_out, stage="loading_model",
+                          detail="загружаю модель распознавания")
+        await transcriber.warm_up()
+
         messages_path = out_dir / MESSAGES_FILE
         current = 0
         chunk: list = []
@@ -192,18 +227,35 @@ async def parse_dialog(
                 nonlocal current
                 for msg in chunk_messages:
                     current += 1
-                    entry = await _process_message(client, msg, tmp_dir, me.id, stats_out)
+
+                    async def report(stage: str, detail: str) -> None:
+                        await progress_cb(current, total, stats_out,
+                                          stage=stage, detail=detail)
+
+                    entry = await _process_message(
+                        client, msg, tmp_dir, me.id, stats_out, report=report
+                    )
                     stats_out.total_posts += 1
                     if entry is None:
                         stats_out.skipped_posts += 1
-                        continue
-                    sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                    stats_out.saved_posts += 1
+                    else:
+                        sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                        stats_out.saved_posts += 1
+
+                    # Media messages already reported themselves; text is cheap
+                    # enough that a periodic tick is plenty.
+                    if entry is not None and entry["kind"] != "text":
+                        sink.flush()
+                        await progress_cb(current, total, stats_out, stage="scanning")
+                    elif current % TEXT_PROGRESS_EVERY == 0:
+                        await progress_cb(current, total, stats_out, stage="scanning")
+
                 sink.flush()
-                await progress_cb(current, total, stats_out)
+                await progress_cb(current, total, stats_out, stage="scanning")
                 logger.info(
-                    "Chunk done: %s/%s processed, saved=%s transcribed=%s",
+                    "Chunk done: %s/%s processed, saved=%s transcribed=%s (%ss of %ss speech)",
                     current, total, stats_out.saved_posts, stats_out.transcribed_count,
+                    stats_out.transcribed_seconds, stats_out.voice_seconds,
                 )
 
             async for message in client.iter_messages(entity, reverse=True):

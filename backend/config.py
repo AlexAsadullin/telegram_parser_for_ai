@@ -31,12 +31,19 @@ DATA_DIR: Path = _resolve(os.getenv("DATA_DIR", "data"))
 DB_PATH: str = str(_resolve(os.getenv("DB_PATH", "backend/history.db")))
 
 # --- Local speech recognition (private-message parsing) ---------------------
-# faster-whisper (CTranslate2). "small" keeps Russian accurate at ~460 MB on
-# disk; "base" is ~140 MB but garbles terms. int8 keeps it CPU-friendly.
+# "small" keeps Russian accurate at ~460 MB on disk; "base" is ~140 MB but
+# garbles terms.
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "ru")
+
+# Engine: "auto" prefers Apple GPU via MLX and falls back to CPU.
+# Force with "mlx" or "faster-whisper".
+WHISPER_BACKEND: str = os.getenv("WHISPER_BACKEND", "auto")
+
+# Only used by the faster-whisper (CPU) backend. CTranslate2 has no Metal
+# support, so there is no GPU option here — that is what the mlx backend is for.
 WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "ru")
 
 # Messages are pulled and processed in chunks so a long chat never has to fit
 # in memory all at once.

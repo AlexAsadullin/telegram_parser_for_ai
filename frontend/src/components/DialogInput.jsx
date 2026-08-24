@@ -8,6 +8,15 @@ export default function DialogInput({ onTaskStart }) {
   const [dialogs, setDialogs] = useState([])
   const [dialogsError, setDialogsError] = useState(null)
   const [loadedDialogs, setLoadedDialogs] = useState(false)
+  const [asr, setAsr] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    axios.get('/api/asr-model')
+      .then((res) => { if (!cancelled) setAsr(res.data) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -58,6 +67,12 @@ export default function DialogInput({ onTaskStart }) {
         Голосовые сообщения и кружки распознаются локальной моделью и попадают
         в общую хронологию чата вместе с текстом.
       </p>
+
+      {asr && (
+        <span className={`asr-badge ${asr.gpu ? 'asr-badge--gpu' : 'asr-badge--cpu'}`}>
+          {asr.gpu ? '⚡' : '🖥'} {asr.device} · модель {asr.model.split('/').pop()}
+        </span>
+      )}
 
       {dialogsError && <p className="error-msg">{dialogsError}</p>}
 

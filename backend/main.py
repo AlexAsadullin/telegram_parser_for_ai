@@ -42,6 +42,8 @@ class TaskState:
     total: int = 0
     done: bool = False
     error: str | None = None
+    stage: str | None = None
+    detail: str | None = None
     waiters: list[asyncio.Queue] = field(default_factory=list)
 
 
@@ -145,11 +147,21 @@ def _start_task(kind: str, target: str, run_parser) -> str:
     _tasks[task_id] = state
     logger.info("[task %s] received %s request: %r", task_id[:8], kind, target)
 
-    async def progress_cb(current: int, total: int, stats: ParseStats) -> None:
+    async def progress_cb(
+        current: int,
+        total: int,
+        stats: ParseStats,
+        stage: str | None = None,
+        detail: str | None = None,
+    ) -> None:
         state.current = current
         state.total = total
         state.stats = stats
-        msg = ProgressMessage(current=current, total=total, stats=stats)
+        state.stage = stage
+        state.detail = detail
+        msg = ProgressMessage(
+            current=current, total=total, stats=stats, stage=stage, detail=detail,
+        )
         for q in list(state.waiters):
             await q.put(msg.model_dump())
 
@@ -234,6 +246,8 @@ async def ws_progress(websocket: WebSocket, task_id: str):
             done=state.done,
             error=state.error,
             stats=state.stats,
+            stage=state.stage,
+            detail=state.detail,
         ).model_dump()
     )
 
@@ -260,6 +274,8 @@ async def get_status(task_id: str):
         done=state.done,
         error=state.error,
         stats=state.stats,
+        stage=state.stage,
+        detail=state.detail,
     ).model_dump()
 
 

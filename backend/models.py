@@ -35,6 +35,11 @@ class ParseStats(BaseModel):
     links_count: int = 0
     # DM parsing only: voice messages and round video notes turned into text
     transcribed_count: int = 0
+    # Seconds of speech found vs. seconds already recognised — drives the
+    # transcription progress bar, which moves very differently from the
+    # message counter (one 5-minute voice note outweighs 200 texts).
+    voice_seconds: int = 0
+    transcribed_seconds: int = 0
 
 
 class ProgressMessage(BaseModel):
@@ -43,6 +48,11 @@ class ProgressMessage(BaseModel):
     done: bool = False
     error: str | None = None
     stats: ParseStats
+    # What the backend is doing right now, so the UI can explain a long pause:
+    # "loading_model" | "scanning" | "downloading" | "transcribing"
+    stage: str | None = None
+    # Human-readable detail for the current item, e.g. "кружок 0:08"
+    detail: str | None = None
 
 
 class ParseResponse(BaseModel):
