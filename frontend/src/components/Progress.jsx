@@ -12,7 +12,7 @@ function clock(seconds) {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-export default function Progress({ data, mode = 'channel' }) {
+export default function Progress({ data, mode = 'channel', onStop, stopping }) {
   if (!data) return null
 
   const { current, total, stats, stage, detail } = data
@@ -92,6 +92,17 @@ export default function Progress({ data, mode = 'channel' }) {
           </>
         )}
       </div>
+
+      {onStop && (
+        <div className="stop-row">
+          <button className="stop-btn" onClick={onStop} disabled={stopping}>
+            {stopping ? 'Останавливаю...' : 'Остановить скачивание'}
+          </button>
+          <span className="stop-note">
+            Скачанные данные {isDm ? 'этого чата' : 'этого канала'} будут удалены
+          </span>
+        </div>
+      )}
     </div>
   )
 }

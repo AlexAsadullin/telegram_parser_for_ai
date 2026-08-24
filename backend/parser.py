@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Callable, Awaitable
@@ -139,6 +140,8 @@ async def parse_channel(
     await start_client(client)
     logger.info("Telegram client connected")
 
+    channel_dir: Path | None = None
+
     try:
         entity = await resolve_channel(client, channel_input)
         channel_dir = DATA_DIR / str(entity.id)
@@ -228,8 +231,20 @@ async def parse_channel(
             stats_out.voice_count, stats_out.files_count, stats_out.links_count,
         )
 
+    except asyncio.CancelledError:
+        # Stopped from the UI. A run rewrites posts.json wholesale, so a partial
+        # directory is not a usable channel — drop it rather than leave a
+        # half-downloaded channel looking complete in the list.
+        if channel_dir is not None:
+            shutil.rmtree(channel_dir, ignore_errors=True)
+            logger.info("Channel parse cancelled — removed partial data: %s", channel_dir)
+        raise
+
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except (Exception, asyncio.CancelledError):
+            pass
         logger.info("Telegram client disconnected")
 
     return stats_out

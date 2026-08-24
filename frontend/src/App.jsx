@@ -21,6 +21,8 @@ export default function App() {
   const [finalStats, setFinalStats] = useState(null)
   const [historyKey, setHistoryKey] = useState(0)
   const [auth, setAuth] = useState({ checked: false, authorized: false, user: null })
+  const [stopping, setStopping] = useState(false)
+  const [stoppedNote, setStoppedNote] = useState(null)
   const wsRef = useRef(null)
 
   useEffect(() => {
@@ -52,6 +54,8 @@ export default function App() {
     setTaskSource(kind)
     setProgress(null)
     setFinalStats(null)
+    setStoppedNote(null)
+    setStopping(false)
 
     const ws = new WebSocket(`/ws/progress/${id}`)
     wsRef.current = ws
@@ -61,6 +65,17 @@ export default function App() {
       if (msg.error) {
         setFinalStats({ error: msg.error })
         ws.close()
+        setHistoryKey((k) => k + 1)
+        return
+      }
+      if (msg.cancelled) {
+        // Stopped on purpose: back to the input, with the data gone.
+        ws.close()
+        setTaskId(null)
+        setProgress(null)
+        setFinalStats(null)
+        setStopping(false)
+        setStoppedNote('Скачивание остановлено, загруженные данные удалены.')
         setHistoryKey((k) => k + 1)
         return
       }
@@ -81,10 +96,39 @@ export default function App() {
     return () => wsRef.current?.close()
   }, [])
 
+  const handleStop = async () => {
+    const what = taskSource === 'dm' ? 'этого чата' : 'этого канала'
+    if (!window.confirm(
+      `Остановить скачивание?\n\nВсе уже сохранённые данные ${what} будут удалены.`
+    )) return
+
+    setStopping(true)
+    try {
+      await axios.post(`/api/tasks/${taskId}/stop`)
+      // The websocket delivers the cancellation; this is only a fallback for a
+      // socket that already dropped.
+      setTimeout(() => {
+        setStopping((busy) => {
+          if (busy) {
+            setTaskId(null)
+            setProgress(null)
+            setStoppedNote('Скачивание остановлено, загруженные данные удалены.')
+            setHistoryKey((k) => k + 1)
+          }
+          return false
+        })
+      }, 3000)
+    } catch (err) {
+      setStopping(false)
+      alert(err.response?.data?.detail || 'Не удалось остановить скачивание')
+    }
+  }
+
   const handleReset = () => {
     setTaskId(null)
     setProgress(null)
     setFinalStats(null)
+    setStoppedNote(null)
   }
 
   // Nothing works without a Telegram session, so the login window comes first.
@@ -190,7 +234,18 @@ export default function App() {
           <DialogInput onTaskStart={(id) => handleTaskStart(id, 'dm')} />
         )}
 
-        {showProgress && <Progress data={progress} mode={taskSource} />}
+        {stoppedNote && showInput && (
+          <div className="stopped-note">{stoppedNote}</div>
+        )}
+
+        {showProgress && (
+          <Progress
+            data={progress}
+            mode={taskSource}
+            onStop={handleStop}
+            stopping={stopping}
+          />
+        )}
 
         {showStats && <Stats stats={finalStats} onReset={handleReset} mode={taskSource} />}
 

@@ -787,3 +787,56 @@ body {
   background: #151b28;
   border: 1px solid #2d3f55;
 }
+
+/* ── Stop a running download ──────────────────────────────────────── */
+
+.stop-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid #1e2a3a;
+}
+
+.stop-btn {
+  padding: 9px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #fca5a5;
+  background: #2a1519;
+  border: 1px solid #7f1d1d;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.stop-btn:hover:not(:disabled) {
+  background: #3d1a20;
+  border-color: #b91c1c;
+}
+
+.stop-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.stop-note {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.stopped-note {
+  margin-bottom: 20px;
+  padding: 12px 16px;
+  font-size: 13px;
+  color: #fcd34d;
+  background: #241d0f;
+  border: 1px solid #78350f;
+  border-radius: 8px;
+}
+
+.status-stopped {
+  color: #fcd34d;
+}

@@ -7,6 +7,21 @@ const STATUS_LABEL = {
   in_progress: 'В процессе',
 }
 
+// A user-stopped run is recorded as 'failed' (the SQLite status column has a
+// CHECK constraint that predates the stop button), but it is not an error and
+// should not be shown as one.
+const STOPPED_PREFIX = 'Остановлено пользователем'
+
+function statusOf(row) {
+  if (row.status === 'failed' && (row.error_message || '').startsWith(STOPPED_PREFIX)) {
+    return { label: 'Остановлен', className: 'status-stopped' }
+  }
+  return {
+    label: STATUS_LABEL[row.status] ?? row.status,
+    className: `status-${row.status}`,
+  }
+}
+
 export default function History({ refreshKey }) {
   const [rows, setRows] = useState([])
   // Loading is derived: the fetch for the current refreshKey hasn't settled yet.
@@ -51,7 +66,7 @@ export default function History({ refreshKey }) {
               <tr key={r.id}>
                 <td>{r.created_at}</td>
                 <td>{r.channel_title || r.channel_username || r.channel_id || '—'}</td>
-                <td className={`status-${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</td>
+                <td className={statusOf(r).className}>{statusOf(r).label}</td>
                 <td>{r.total_posts}</td>
                 <td>{r.saved_posts}</td>
                 <td>{r.skipped_posts}</td>

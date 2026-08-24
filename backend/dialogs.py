@@ -14,6 +14,7 @@ Two memory rules drive the design:
     for the whole run — the chat is only considered processed once every chunk
     is done, and only then is the directory removed.
 """
+import asyncio
 import json
 import logging
 import os
@@ -47,11 +48,12 @@ TEXT_PROGRESS_EVERY = 10
 _KIND_RU = {"voice": "голосовое", "video_note": "кружок"}
 
 
-def _clock(seconds: int | None) -> str:
+def _clock(seconds: float | None) -> str:
     """Format a duration the way a chat client shows it: 0:07, 2:31."""
     if not seconds:
         return ""
-    return f"{seconds // 60}:{seconds % 60:02d}"
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
 
 
 def dialog_dir(dialog_id: str | int) -> Path:
@@ -84,12 +86,21 @@ def _voice_kind(message) -> str | None:
 
 
 def _duration(message) -> int | None:
+    """
+    Duration in whole seconds.
+
+    Telegram types these differently: DocumentAttributeAudio.duration is an int
+    but DocumentAttributeVideo.duration is a float, so round video notes used to
+    reach the formatter as e.g. 8.44. Normalised here, at the single place the
+    value enters the code.
+    """
     media = message.media
     if not isinstance(media, MessageMediaDocument):
         return None
     for attr in getattr(media.document, "attributes", []):
         if attr.__class__.__name__ in ("DocumentAttributeAudio", "DocumentAttributeVideo"):
-            return getattr(attr, "duration", None)
+            raw = getattr(attr, "duration", None)
+            return int(raw) if raw is not None else None
     return None
 
 
@@ -184,6 +195,8 @@ async def parse_dialog(
     tmp_dir = Path(tempfile.mkdtemp(prefix="tg_dm_media_"))
     logger.info("Temporary media directory: %s", tmp_dir)
 
+    out_dir: Path | None = None
+
     try:
         entity = await resolve_dialog(client, dialog_input)
         me = await client.get_me()
@@ -274,11 +287,24 @@ async def parse_dialog(
             stats_out.voice_count, stats_out.videos_count, stats_out.transcribed_count,
         )
 
+    except asyncio.CancelledError:
+        # Stopped from the UI: a half-parsed chat is not useful, and the run
+        # truncated messages.jsonl on start anyway, so drop the whole directory.
+        if out_dir is not None:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            logger.info("DM parse cancelled — removed partial data: %s", out_dir)
+        raise
+
     finally:
         # The whole chat is done (or has failed) — only now drop the media.
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Temporary media directory removed: %s", tmp_dir)
-        await client.disconnect()
+        # Cleanup runs while the task may already be cancelled; a second
+        # cancellation must not mask the reason we are unwinding.
+        try:
+            await client.disconnect()
+        except (Exception, asyncio.CancelledError):
+            pass
         logger.info("Telegram client disconnected")
 
     return stats_out

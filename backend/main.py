@@ -42,6 +42,7 @@ class TaskState:
     total: int = 0
     done: bool = False
     error: str | None = None
+    cancelled: bool = False
     stage: str | None = None
     detail: str | None = None
     waiters: list[asyncio.Queue] = field(default_factory=list)
@@ -189,6 +190,19 @@ def _start_task(kind: str, target: str, run_parser) -> str:
             )
             for q in list(state.waiters):
                 await q.put(msg.model_dump())
+        except asyncio.CancelledError:
+            # The parser has already deleted whatever it had written.
+            state.cancelled = True
+            state.done = True
+            logger.info("[task %s] STOPPED by user; partial data removed", task_id[:8])
+            # Shielded: the task is unwinding, and this record should still land.
+            await asyncio.shield(database.update_record(
+                record_id, "failed", state.stats.model_dump(),
+                error_message="Остановлено пользователем, скачанные данные удалены",
+            ))
+            for q in list(state.waiters):
+                await q.put({"cancelled": True, "done": True})
+            raise
         except Exception as exc:
             error_msg = str(exc) or exc.__class__.__name__
             state.error = error_msg
@@ -225,6 +239,30 @@ async def start_parse_dm(req: ParseDMRequest):
     return ParseResponse(task_id=task_id)
 
 
+@app.post("/api/tasks/{task_id}/stop")
+async def stop_task(task_id: str):
+    """
+    Stop a running parse and discard what it downloaded.
+
+    The parser deletes its own output directory as it unwinds, so a stopped run
+    leaves nothing half-finished behind.
+    """
+    state = _tasks.get(task_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if state.done:
+        return {"stopped": False, "detail": "Задача уже завершена"}
+
+    logger.info("[task %s] stop requested", task_id[:8])
+    state.cancelled = True
+    if state.task is not None:
+        state.task.cancel()
+        # asyncio.wait does not re-raise the CancelledError at us, unlike await.
+        await asyncio.wait([state.task], timeout=30)
+
+    return {"stopped": True, "detail": "Скачивание остановлено, данные удалены"}
+
+
 @app.websocket("/ws/progress/{task_id}")
 async def ws_progress(websocket: WebSocket, task_id: str):
     await websocket.accept()
@@ -245,6 +283,7 @@ async def ws_progress(websocket: WebSocket, task_id: str):
             total=state.total,
             done=state.done,
             error=state.error,
+            cancelled=state.cancelled,
             stats=state.stats,
             stage=state.stage,
             detail=state.detail,
@@ -273,6 +312,7 @@ async def get_status(task_id: str):
         total=state.total,
         done=state.done,
         error=state.error,
+        cancelled=state.cancelled,
         stats=state.stats,
         stage=state.stage,
         detail=state.detail,

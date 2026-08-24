@@ -47,6 +47,7 @@ class ProgressMessage(BaseModel):
     total: int
     done: bool = False
     error: str | None = None
+    cancelled: bool = False
     stats: ParseStats
     # What the backend is doing right now, so the UI can explain a long pause:
     # "loading_model" | "scanning" | "downloading" | "transcribing"
