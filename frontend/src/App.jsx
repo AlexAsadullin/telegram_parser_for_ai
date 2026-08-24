@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import axios from 'axios'
+import AuthModal from './components/AuthModal'
 import ChannelInput from './components/ChannelInput'
 import DialogInput from './components/DialogInput'
 import DownloadedChannels from './components/DownloadedChannels'
@@ -18,7 +20,32 @@ export default function App() {
   const [progress, setProgress] = useState(null)
   const [finalStats, setFinalStats] = useState(null)
   const [historyKey, setHistoryKey] = useState(0)
+  const [auth, setAuth] = useState({ checked: false, authorized: false, user: null })
   const wsRef = useRef(null)
+
+  useEffect(() => {
+    let cancelled = false
+    axios.get('/api/auth/status')
+      .then((res) => {
+        if (!cancelled) {
+          setAuth({ checked: true, authorized: res.data.authorized, user: res.data.user })
+        }
+      })
+      .catch(() => {
+        // Backend unreachable: let the app render and surface errors in context.
+        if (!cancelled) setAuth({ checked: true, authorized: false, user: null })
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  const handleLogout = async () => {
+    try {
+      await axios.post('/api/auth/logout')
+    } catch {
+      // fall through — re-showing the login window is the useful outcome
+    }
+    setAuth({ checked: true, authorized: false, user: null })
+  }
 
   const handleTaskStart = useCallback((id, kind) => {
     setTaskId(id)
@@ -58,6 +85,21 @@ export default function App() {
     setTaskId(null)
     setProgress(null)
     setFinalStats(null)
+  }
+
+  // Nothing works without a Telegram session, so the login window comes first.
+  if (auth.checked && !auth.authorized) {
+    return (
+      <div className="app">
+        <header className="app-header">
+          <h1>Telegram Channel Parser</h1>
+          <p className="app-subtitle">Полная выгрузка канала для AI-аналитики</p>
+        </header>
+        <AuthModal
+          onAuthorized={(user) => setAuth({ checked: true, authorized: true, user })}
+        />
+      </div>
+    )
   }
 
   if (view === 'channels') {
@@ -109,6 +151,16 @@ export default function App() {
               Скачанные переписки
             </button>
           </div>
+        </div>
+
+        <div className="account-bar">
+          {auth.user && (
+            <span className="account-name">
+              {auth.user.name}
+              {auth.user.username && ` · @${auth.user.username}`}
+            </span>
+          )}
+          <button className="auth-link" onClick={handleLogout}>Выйти</button>
         </div>
       </header>
 

@@ -9,8 +9,11 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 
-from . import database, dialogs, exporter, parser, transcriber
+from . import auth, database, dialogs, exporter, parser, transcriber
 from .models import (
+    AuthCodeRequest,
+    AuthPasswordRequest,
+    AuthPhoneRequest,
     HistoryRecord,
     ParseDMRequest,
     ParseRequest,
@@ -53,9 +56,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Telegram Parser", lifespan=lifespan)
 
+# The login endpoints accept a phone code and a cloud password, so the API is
+# no longer safe to expose to any origin: a page in another tab could otherwise
+# drive the login flow. Restricted to the local dev servers that need it.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -65,6 +76,61 @@ app.add_middleware(
 async def root():
     """Backend serves only the API; the UI lives on the Vite dev server."""
     return RedirectResponse("/docs")
+
+
+# ---------------------------------------------------------------------------
+# Telegram login
+# ---------------------------------------------------------------------------
+
+@app.get("/api/auth/status")
+async def auth_status():
+    """Whether the stored session is usable, and as whom."""
+    try:
+        return await auth.status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Не удалось проверить сессию: {exc}")
+
+
+@app.post("/api/auth/send-code")
+async def auth_send_code(req: AuthPhoneRequest):
+    """Ask Telegram to send a login code."""
+    try:
+        return await auth.send_code(req.phone)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/auth/sign-in")
+async def auth_sign_in(req: AuthCodeRequest):
+    """Finish the login with the code from Telegram."""
+    try:
+        return await auth.sign_in(req.code)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/auth/password")
+async def auth_password(req: AuthPasswordRequest):
+    """Second factor for accounts with a cloud password."""
+    try:
+        return await auth.sign_in_password(req.password)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/auth/cancel")
+async def auth_cancel():
+    """Abandon a login in progress."""
+    return await auth.cancel()
+
+
+@app.post("/api/auth/logout")
+async def auth_logout():
+    """Log out and invalidate the stored session."""
+    try:
+        return await auth.log_out()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Не удалось выйти: {exc}")
 
 
 def _start_task(kind: str, target: str, run_parser) -> str:

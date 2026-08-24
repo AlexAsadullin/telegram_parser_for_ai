@@ -9,6 +9,18 @@ class ParseDMRequest(BaseModel):
     dialog: str
 
 
+class AuthPhoneRequest(BaseModel):
+    phone: str
+
+
+class AuthCodeRequest(BaseModel):
+    code: str
+
+
+class AuthPasswordRequest(BaseModel):
+    password: str
+
+
 class ParseStats(BaseModel):
     channel_id: str = ""
     channel_username: str = ""
