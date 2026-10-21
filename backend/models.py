@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -7,6 +9,8 @@ class ParseRequest(BaseModel):
 
 class ParseDMRequest(BaseModel):
     dialog: str
+    # Only messages sent at or after this moment; a bare date means local midnight.
+    since: datetime | None = None
 
 
 class AuthPhoneRequest(BaseModel):

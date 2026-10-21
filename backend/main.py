@@ -234,7 +234,7 @@ async def start_parse_dm(req: ParseDMRequest):
     task_id = _start_task(
         "dm parse",
         req.dialog,
-        lambda cb, stats: dialogs.parse_dialog(req.dialog, cb, stats),
+        lambda cb, stats: dialogs.parse_dialog(req.dialog, cb, stats, since=req.since),
     )
     return ParseResponse(task_id=task_id)
 

@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -226,8 +227,11 @@ async def parse_dialog(
     dialog_input: str,
     progress_cb: ProgressCallback,
     stats_out: ParseStats,
+    since: datetime | None = None,
 ) -> ParseStats:
     logger.info("=== Starting DM parse for input: %r ===", dialog_input)
+    if since is not None and since.tzinfo is None:
+        since = since.astimezone()
     client = _make_client()
     await start_client(client)
     logger.info("Telegram client connected")
@@ -333,7 +337,9 @@ async def parse_dialog(
                     stats_out.transcribed_seconds, stats_out.voice_seconds,
                 )
 
-            async for message in client.iter_messages(entity, reverse=True):
+            # With reverse=True, offset_date makes Telegram start at that moment
+            # and walk forward, so older history is never fetched.
+            async for message in client.iter_messages(entity, reverse=True, offset_date=since):
                 chunk.append(message)
                 if len(chunk) >= DM_CHUNK_SIZE:
                     await flush(chunk)
