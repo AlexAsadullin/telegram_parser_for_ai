@@ -31,7 +31,7 @@ from .config import (
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
 )
-from .gpu_detect import detect_device
+from .gpu_detect import detect_device, whisper_on_torch_available
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,28 @@ def _resolve_backend() -> str:
         return "mlx"
     if WHISPER_BACKEND == "faster-whisper":
         return "faster-whisper"
+    if WHISPER_BACKEND == "whisper-torch":
+        return "whisper-torch"
 
-    # auto
+    # auto — on this `linux` branch the GPU is the default whenever it is
+    # usable. AMD ROCm (Radeon RX 580) cannot be served by CTranslate2, so
+    # when the probe finds a HIP device we route through openai-whisper on
+    # torch+ROCm instead of silently staying on CPU.
     if _mlx_available():
         return "mlx"
-    logger.info("MLX unavailable — falling back to faster-whisper on CPU")
+    device, _ = detect_device(WHISPER_DEVICE)
+    if device == "rocm":
+        if whisper_on_torch_available():
+            logger.info("AMD ROCm GPU detected — using openai-whisper on torch+HIP")
+            return "whisper-torch"
+        logger.warning(
+            "ROCm GPU found but openai-whisper/torch not installed — "
+            "using faster-whisper (%s)", device,
+        )
+    if device != "cpu":
+        logger.info("GPU detected for transcription: %s", device)
+    else:
+        logger.info("MLX unavailable — falling back to faster-whisper on CPU")
     return "faster-whisper"
 
 
@@ -95,6 +112,29 @@ def _load() -> tuple[str, object]:
             # MLX loads lazily on first transcribe and caches internally;
             # the repo id is all we need to carry around.
             _model = repo
+        elif backend == "whisper-torch":
+            # AMD ROCm path (Radeon RX 580): CTranslate2 has no HIP backend,
+            # so run openai-whisper directly on torch+ROCm.
+            import whisper
+
+            device, _ = detect_device(WHISPER_DEVICE)
+            logger.info(
+                "Using openai-whisper on torch (%s), model %r",
+                device, WHISPER_MODEL,
+            )
+            try:
+                _model = whisper.load_model(WHISPER_MODEL, device=device)
+            except Exception as exc:
+                logger.warning(
+                    "openai-whisper on %s failed (%s) — falling back to "
+                    "faster-whisper CPU int8", device, exc,
+                )
+                from faster_whisper import WhisperModel
+
+                _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                backend = "faster-whisper"
+            _device_in_use = device
+            _compute_in_use = "float16" if device != "cpu" else "int8"
         else:
             from faster_whisper import WhisperModel
 
@@ -242,6 +282,14 @@ def _transcribe_sync(path: str) -> str:
 
         result = mlx_whisper.transcribe(
             audio, path_or_hf_repo=model, language=WHISPER_LANGUAGE, verbose=None
+        )
+        return (result.get("text") or "").strip()
+
+    if backend == "whisper-torch":
+        # openai-whisper expects float32 numpy and runs on the torch device
+        # (HIP for the RX 580) chosen at load time. fp16 is safe on this GPU.
+        result = model.transcribe(
+            audio, language=WHISPER_LANGUAGE, fp16=True, verbose=None
         )
         return (result.get("text") or "").strip()
 
