@@ -29,21 +29,10 @@ logger = logging.getLogger(__name__)
 @functools.lru_cache(maxsize=1)
 def _probe() -> tuple[str, str]:
     """Try each GPU path once per process; cache the verdict."""
-    # 1) NVIDIA / CUDA — the stock faster-whisper wheel supports this out of
-    #    the box, so check it first.
-    try:
-        import ctranslate2
-
-        if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda", "float16"
-    except Exception:
-        pass
-
-    # 2) AMD via ROCm/HIP. CTranslate2 has no native HIP backend; the AMD path
-    #    goes through the PyTorch-ROCm stack. If torch sees a HIP device we can
-    #    still accelerate Whisper with the `mlx`-style local engines or fall
-    #    back to openai-whisper on torch+ROCm. We report "rocm" here and let
-    #    the transcriber decide which engine can consume it.
+    # 0) AMD ROCm/HIP first on this branch — the target machine is a Radeon
+    #    RX 580 (Polaris/gfx803). CTranslate2 has no native HIP backend, so
+    #    when torch sees a HIP device we transcribe through openai-whisper on
+    #    torch+ROCm ("rocm" here means: use the WhisperOnTorch engine below).
     try:
         import torch
 
@@ -52,7 +41,30 @@ def _probe() -> tuple[str, str]:
     except Exception:
         pass
 
+    # 1) NVIDIA / CUDA — the stock faster-whisper wheel supports this out of
+    #    the box, so check it next.
+    try:
+        import ctranslate2
+
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda", "float16"
+    except Exception:
+        pass
+
     return "cpu", "int8"
+
+
+def whisper_on_torch_available() -> bool:
+    """True when a ROCm/CUDA-enabled torch + openai-whisper can run the GPU."""
+    device, _ = _probe()
+    if device == "cpu":
+        return False
+    try:
+        import whisper  # noqa: F401  (openai-whisper package)
+
+        return True
+    except Exception:
+        return False
 
 
 def detect_device(forced: str | None = None) -> tuple[str, str]:
