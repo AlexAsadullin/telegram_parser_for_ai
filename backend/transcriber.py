@@ -6,12 +6,13 @@ Two backends, because the right one depends on the machine:
   * mlx      — Apple MLX, runs on the GPU of M-series chips. Measured on an
                M2 Air: 30s of Russian speech in 1.6s (~19x realtime), about
                2.6x faster than the CPU path.
-  * faster-whisper — CTranslate2 on CPU. The portable fallback. It cannot use
-               an Apple GPU at all: the package ships without CUDA and
-               CTranslate2 has no Metal backend, so "mps"/"metal" are rejected
-               outright.
+  * faster-whisper — CTranslate2. Uses CUDA on NVIDIA; on AMD GPUs (Radeon RX
+               580, gfx803) it runs through the ROCm/HIP stack when a matching
+               ctranslate2/torch build is installed. Falls back to CPU.
 
-"auto" (the default) picks mlx when it imports and falls back to CPU.
+"auto" (the default) picks mlx when it imports, otherwise probes for a CUDA or
+ROCm GPU (gpu_detect.py) and uses it; only when nothing answers does it settle
+on the CPU. On this branch the GPU is the default whenever it is usable.
 
 Audio is always decoded with PyAV, including for the MLX backend whose own
 loader would otherwise shell out to an ffmpeg binary. That keeps ffmpeg out of
@@ -30,6 +31,7 @@ from .config import (
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
 )
+from .gpu_detect import detect_device
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ SAMPLE_RATE = 16000
 
 _model = None
 _backend: str | None = None
+_device_in_use: str = "cpu"
+_compute_in_use: str = "int8"
 _model_lock = threading.Lock()
 
 
@@ -73,7 +77,7 @@ def _resolve_backend() -> str:
 
 def _load() -> tuple[str, object]:
     """Load the model once. Safe to call from several threads."""
-    global _model, _backend
+    global _model, _backend, _device_in_use, _compute_in_use
     if _model is not None:
         return _backend, _model
 
@@ -94,15 +98,39 @@ def _load() -> tuple[str, object]:
         else:
             from faster_whisper import WhisperModel
 
+            # GPU by default on this branch: "auto" probes for CUDA/ROCm and
+            # only settles on CPU when nothing answers. An explicit
+            # WHISPER_DEVICE in .env still wins.
+            device, probed_compute = detect_device(WHISPER_DEVICE)
+            compute_type = (
+                WHISPER_COMPUTE_TYPE
+                if WHISPER_COMPUTE_TYPE not in ("", "auto")
+                else probed_compute
+            )
             logger.info(
                 "Using faster-whisper on %s (compute_type=%s), model %r",
-                WHISPER_DEVICE, WHISPER_COMPUTE_TYPE, WHISPER_MODEL,
+                device, compute_type, WHISPER_MODEL,
             )
-            _model = WhisperModel(
-                WHISPER_MODEL,
-                device=WHISPER_DEVICE,
-                compute_type=WHISPER_COMPUTE_TYPE,
-            )
+            try:
+                _model = WhisperModel(
+                    WHISPER_MODEL, device=device, compute_type=compute_type,
+                )
+            except Exception as exc:
+                if device == "cpu":
+                    raise
+                # ROCm/CUDA build mismatch (e.g. plain ctranslate2 wheel on an
+                # AMD card): never lose the run — degrade to CPU with a loud
+                # warning instead of failing every voice message.
+                logger.warning(
+                    "GPU init failed (%s: %s) — falling back to CPU int8",
+                    device, exc,
+                )
+                device, compute_type = "cpu", "int8"
+                _model = WhisperModel(
+                    WHISPER_MODEL, device=device, compute_type=compute_type,
+                )
+            _device_in_use = device
+            _compute_in_use = compute_type
 
         _backend = backend
         return _backend, _model
@@ -260,13 +288,22 @@ def model_info() -> dict:
     """Describe the configured engine without forcing the model to load."""
     backend = _backend or ("mlx" if (WHISPER_BACKEND in ("auto", "mlx") and _mlx_available())
                            else "faster-whisper")
-    on_gpu = backend == "mlx"
+    if backend == "mlx":
+        device, compute, gpu = "Apple GPU (MLX)", "float16", True
+    elif _model is not None:  # loaded — report what actually won
+        device, compute = _device_in_use, _compute_in_use
+        gpu = device != "cpu"
+    else:  # not loaded yet — report what the probe predicts
+        device, compute = detect_device(WHISPER_DEVICE)
+        gpu = device != "cpu"
+        if WHISPER_COMPUTE_TYPE not in ("", "auto"):
+            compute = WHISPER_COMPUTE_TYPE
     return {
         "backend": backend,
-        "model": _mlx_repo(WHISPER_MODEL) if on_gpu else WHISPER_MODEL,
-        "device": "Apple GPU (MLX)" if on_gpu else WHISPER_DEVICE,
-        "gpu": on_gpu,
-        "compute_type": "float16" if on_gpu else WHISPER_COMPUTE_TYPE,
+        "model": _mlx_repo(WHISPER_MODEL) if backend == "mlx" else WHISPER_MODEL,
+        "device": device,
+        "gpu": gpu,
+        "compute_type": compute,
         "language": WHISPER_LANGUAGE,
         "loaded": _model is not None,
     }
