@@ -1,0 +1,18 @@
+telethon==1.44.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-dotenv==1.2.3
+aiosqlite==0.22.1
+aiofiles==25.1.0
+pydantic==2.13.4
+
+# Local speech recognition for private messages (voice + round video notes).
+# Pulls in ctranslate2, av (PyAV), tokenizers, onnxruntime and numpy.
+# PyAV also decodes the audio track of .mp4 video notes, so no ffmpeg needed.
+# CPU-only: CTranslate2 has no Metal backend and this wheel has no CUDA.
+faster-whisper==1.2.1
+
+# Apple Silicon GPU backend. Optional — WHISPER_BACKEND=auto falls back to
+# faster-whisper on CPU if this is missing (e.g. on Linux/Windows).
+# Measured on an M2 Air: 2.6x faster than the CPU path.
+mlx-whisper==0.4.3 ; sys_platform == "darwin" and platform_machine == "arm64"
