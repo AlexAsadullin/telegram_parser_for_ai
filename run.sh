@@ -8,6 +8,9 @@
 # Ports can be overridden:  BACKEND_PORT=8001 FRONTEND_PORT=5174 ./run.sh
 # Setup only (venv, .env, npm deps, SQLite db), without starting servers:
 #   ./run.sh --setup-only        (alias: SETUP_ONLY=1 ./run.sh)
+# GPU (linux branch): install ROCm + PyTorch(HIP) + openai-whisper for an
+# AMD Radeon automatically (asks for sudo; idempotent):
+#   ./run.sh --with-gpu         (or just run ./run.sh and answer "y")
 #
 # uvicorn and vite are invoked directly rather than through `npm run` or an
 # activated venv: one process each, so Ctrl+C reaches them instead of stopping
@@ -73,7 +76,8 @@ port_busy() {
 for arg in "$@"; do
     case "$arg" in
         --setup-only) SETUP_ONLY=1 ;;
-        *) die "неизвестный аргумент: $arg (доступен только --setup-only)" ;;
+        --with-gpu) : ;;  # handled in the GPU section below
+        *) die "неизвестный аргумент: $arg (доступны --setup-only, --with-gpu)" ;;
     esac
 done
 
@@ -142,30 +146,164 @@ fi
 info "База данных готова: ${_dbmsg}"
 
 # --- GPU (linux branch) ---------------------------------------------------
-# Detect an AMD Radeon (RX 580 / gfx803) and, if ROCm is missing or broken,
-# print a concrete setup plan instead of silently running on CPU.
-gpu_status=$(TG_API_ID=dummy TG_API_HASH=dummy venv/bin/python -c '
+# Detect an AMD Radeon (RX 580 / gfx803). If ROCm is missing, run.sh can
+# install it automatically (--with-gpu); otherwise it prints the concrete
+# setup plan instead of silently running on CPU.
+
+warn() {
+    printf '\033[33mВНИМАНИЕ:\033[0m %s\n' "$1"
+}
+
+amd_gpu_present() {
+    command -v lspci >/dev/null 2>&1 || return 1
+    lspci -nn 2>/dev/null | grep -qiE 'VGA compatible controller.*\[1002:'
+}
+
+rocm_installed() {
+    [ -d /opt/rocm ] && /opt/rocm/bin rocminfo >/dev/null 2>&1
+}
+
+hip_torch_installed() {
+    venv/bin/python - >/dev/null 2>&1 <<'PYEOF'
+import sys
+try:
+    import torch
+except Exception:
+    sys.exit(1)
+sys.exit(0 if getattr(torch.version, "hip", None) else 1)
+PYEOF
+}
+
+ubuntu_codename() {
+    if command -v lsb_release >/dev/null 2>&1; then
+        lsb_release -cs
+    elif [ -r /etc/os-release ]; then
+        . /etc/os-release
+        case "${VERSION_CODENAME:-}" in
+            noble|jammy) echo "$VERSION_CODENAME" ;;
+            *) echo "" ;;
+        esac
+    else
+        echo ""
+    fi
+}
+
+groups_changed=0
+
+add_user_groups() {
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx render && \
+       id -nG "$USER" | tr ' ' '\n' | grep -qx video; then
+        return 0
+    fi
+    info "Добавляю пользователя $USER в группы render,video..."
+    sudo usermod -aG render,video "$USER" \
+        || warn "не удалось добавить в группы — выполните вручную: sudo usermod -aG render,video $USER"
+    groups_changed=1
+}
+
+install_rocm() {
+    local codename deb url tmp
+    command -v lspci >/dev/null 2>&1 || die "не найден lspci (установите пакет pciutils)"
+    command -v sudo >/dev/null 2>&1 || die "для установки ROCm нужен sudo"
+    command -v wget >/dev/null 2>&1 || die "не найден wget (установите: sudo apt install wget)"
+    codename=$(ubuntu_codename)
+    [ -n "$codename" ] || die "автоустановка ROCm поддерживает только Ubuntu 22.04 (jammy) и 24.04 (noble)"
+
+    info "Устанавливаю ROCm для Ubuntu ${codename} (пакет amdgpu-install, ~2 ГБ)..."; 
+    deb="amdgpu-install_6.2.60204-1_all.deb"
+    url="https://repo.radeon.com/amdgpu-install/6.2.4/ubuntu/${codename}/${deb}"
+    tmp="/tmp/${deb}"
+    wget -q --show-progress -O "$tmp" "$url" || die "не скачался amdgpu-install с ${url}"
+    sudo apt install -y "$tmp" || die "не удалось установить ${deb}"
+    sudo amdgpu-install -y --usecase=rocm --no-dkms || die "amdgpu-install завершился неудачей"
+    rm -f "$tmp"
+    add_user_groups
+    info "ROCm установлен."
+}
+
+install_hip_torch() {
+    info "Устанавливаю PyTorch с HIP + openai-whisper в venv (~3–4 ГБ)..."
+    venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm6.2 \
+        openai-whisper "torch>=2.4" torchaudio || die "pip install (rocm6.2) завершился неудачей"
+    touch venv/.deps-installed
+    info "PyTorch/HIP готов."
+}
+
+confirm() {
+    # confirm "вопрос?" -> 0 если y/yes
+    printf '%s [y/N] ' "$1"
+    read -r ans || ans=""
+    case "${ans,,}" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+if amd_gpu_present; then
+    # ./run.sh --with-gpu  →  non-interactive full setup (idempotent).
+    if [ "${1:-}" = "--with-gpu" ]; then
+        rocm_installed || install_rocm
+        hip_torch_installed || install_hip_torch
+        shift
+    fi
+
+    if ! rocm_installed; then
+        printf '\n\033[33mНайдена видеокарта AMD, но ROCm не установлен — транскрибация пойдёт на CPU.\033[0m\n'
+        if confirm "Установить ROCm сейчас? Требуется sudo (~2 ГБ)"; then
+            install_rocm
+        else
+            printf '   Пропускаю. Позже: \033[36m./run.sh --with-gpu\033[0m\n'
+        fi
+    fi
+
+    if rocm_installed && ! hip_torch_installed; then
+        if confirm "Установить PyTorch(HIP) + openai-whisper в venv (~3–4 ГБ)?"; then
+            install_hip_torch
+        else
+            printf '   Пропускаю. Без torch с HIP сборкой GPU использоваться не будет. Команда:\n'
+            printf '     venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm6.2 openai-whisper "torch>=2.4" torchaudio\n'
+        fi
+    fi
+
+    if rocm_installed && hip_torch_installed; then
+        info "GPU-окружение готово (ROCm + torch/HIP)."
+        if [ "$groups_changed" -eq 1 ]; then
+            printf '\n\033[33mГруппы добавлены, но действуют только после перелогина.\033[0m\n'
+            printf 'Проверьте после перезагрузки: \033[36mrocminfo\033[0m (должна быть gfx803), затем снова ./run.sh\n'
+            if ! confirm "Продолжить запуск прямо сейчас (может остаться на CPU)?"; then
+                trap - INT TERM EXIT
+                exit 0
+            fi
+        fi
+    fi
+fi
+
+# Print whatever the detector still reports (e.g. vfio-passthrough warning).
+# HSA_OVERRIDE_GFX_VERSION is exported for Polaris cards so the backend (and
+# any ROCm child processes) inherit it without touching ~/.bashrc.
+gpu_env=""
+if amd_gpu_present && grep -qi 'polaris\|rx 5[0-8]0' <<<"$(lspci -nn 2>/dev/null)"; then
+    export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}"
+    export OCL_ENABLE_SYSTEM_SCOPE="${OCL_ENABLE_SYSTEM_SCOPE:-0}"
+    info "Polaris (gfx803): экспортирую HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION для этого запуска"
+    gpu_env="HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION OCL_ENABLE_SYSTEM_SCOPE=$OCL_ENABLE_SYSTEM_SCOPE"
+fi
+gpu_status=$(TG_API_ID=dummy TG_API_HASH=dummy env $gpu_env venv/bin/python -c '
 import sys; sys.path.insert(0, ".")
 from backend import gpu_detect as g
 plan = g.setup_plan()
 kind = plan.get("kind", "")
 print(kind)
-if kind == "setup_required":
-    for s in plan.get("steps", []):
-        print("  • " + s)
-    for c in plan.get("script", []):
-        print("    $ " + c)
+for s in plan.get("steps", []):
+    print("  • " + s)
 ' 2>/dev/null || true)
 gpu_kind="${gpu_status%%$'\n'*}"
 case "$gpu_kind" in
     ready)
         info "GPU готов к транскрибации (ROCm/HIP активен)" ;;
     setup_required)
-        printf '\n\033[33mНайдена видеокарта AMD, но ROCm не настроен — транскрибация пойдёт на CPU.\033[0m\n'
+        printf '\n\033[33mТранскрибация пойдёт на CPU. Осталось настроить:\033[0m\n'
         printf '%s\n' "${gpu_status#*$'\n'}"
-        printf '\033[36mПосле установки ROCm/torch перезапустите ./run.sh — GPU определится автоматически.\033[0m\n\n' ;;
+        printf '\033[36mИли выполните: ./run.sh --with-gpu (или перезапустите ./run.sh и согласитесь на установку)\033[0m\n\n' ;;
     passthrough)
-        printf '\n\033[33m%s\033[0m\n\n' "$(printf '%s' "$gpu_status" | tail -n +2 | head -n2)" ;;
+        printf '\n\033[33m%s\033[0m\n\n' "$(printf '%s' "$gpu_status" | tail -n +2)" ;;
     no_amd_gpu|*)
         : ;; # silent when there is no AMD card here
 esac
