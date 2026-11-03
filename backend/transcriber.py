@@ -109,10 +109,100 @@ def _load() -> tuple[str, object]:
 
 
 def _decode(path: str):
-    """Decode any container to mono 16 kHz float32 via PyAV."""
-    from faster_whisper.audio import decode_audio
+    """
+    Decode any container (.ogg/opus voice, .mp4 round notes) to mono
+    16 kHz float32 via PyAV.
 
-    return decode_audio(path, sampling_rate=SAMPLE_RATE)
+    This is a local copy of faster_whisper.audio.decode_audio with one
+    difference: `metadata_errors="ignore"` was added to av.open() in PyAV 15,
+    and faster-whisper 1.2.x passes it unconditionally. On an older PyAV (e.g.
+    14.x, pulled in transitively or left over from a previous install) every
+    transcription died with "open() got an unexpected keyword argument
+    'metadata_errors'". Probing the signature once keeps us compatible with
+    both, so no media file is ever lost to a version mismatch.
+    """
+    import gc
+    import io
+    import itertools
+
+    import av
+    import numpy as np
+
+    def _ignore_invalid_frames(frames):
+        iterator = iter(frames)
+        while True:
+            try:
+                yield next(iterator)
+            except StopIteration:
+                break
+            except av.error.InvalidDataError:
+                continue
+
+    def _group_frames(frames, num_samples=None):
+        fifo = av.audio.fifo.AudioFifo()
+        for frame in frames:
+            frame.pts = None  # Ignore timestamp check.
+            fifo.write(frame)
+            if num_samples is not None and fifo.samples >= num_samples:
+                yield fifo.read()
+        if fifo.samples > 0:
+            yield fifo.read()
+
+    def _resample_frames(frames, resampler):
+        for frame in itertools.chain(frames, [None]):
+            yield from resampler.resample(frame)
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=SAMPLE_RATE,
+    )
+
+    raw_buffer = io.BytesIO()
+    dtype = None
+
+    open_kwargs = {}
+    if _AV_SUPPORTS_METADATA_ERRORS:
+        open_kwargs["metadata_errors"] = "ignore"
+
+    with av.open(path, mode="r", **open_kwargs) as container:
+        frames = container.decode(audio=0)
+        frames = _ignore_invalid_frames(frames)
+        frames = _group_frames(frames, 500000)
+        frames = _resample_frames(frames, resampler)
+
+        for frame in frames:
+            array = frame.to_ndarray()
+            dtype = array.dtype
+            raw_buffer.write(array)
+
+    # The resampler leaks unless the GC is run manually
+    # (faster-whisper issue #390).
+    del resampler
+    gc.collect()
+
+    audio = np.frombuffer(raw_buffer.getbuffer(), dtype=dtype)
+    return audio.astype(np.float32) / 32768.0
+
+
+def _av_supports_metadata_errors() -> bool:
+    try:
+        import inspect
+
+        import av
+        # PyAV is a compiled extension; its open() exposes the accepted
+        # keywords through __doc__ rather than an introspectable signature.
+        doc = getattr(av.open, "__doc__", "") or ""
+        if "metadata_errors" in doc:
+            return True
+        sig = inspect.signature(av.open)
+        if "metadata_errors" in sig.parameters:
+            return True
+        # Anything **kwargs-ish cannot be probed reliably — assume modern.
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except Exception:
+        return False
+
+
+_AV_SUPPORTS_METADATA_ERRORS = _av_supports_metadata_errors()
 
 
 def _transcribe_sync(path: str) -> str:

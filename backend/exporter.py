@@ -284,9 +284,9 @@ def iter_dialog_export(dialog_id: str):
     """
     out_dir = dialogs.dialog_dir(dialog_id)
     info_path = out_dir / dialogs.INFO_FILE
-    messages_path = out_dir / dialogs.MESSAGES_FILE
+    messages_paths = dialogs.dialog_message_paths(out_dir)
 
-    if not info_path.exists() or not messages_path.exists():
+    if not info_path.exists() or not messages_paths:
         raise FileNotFoundError(f"Dialog data not found for id={dialog_id}")
 
     with info_path.open(encoding="utf-8") as f:
@@ -298,7 +298,7 @@ def iter_dialog_export(dialog_id: str):
 
     total = 0
     transcribed = 0
-    for entry in dialogs.iter_messages(messages_path):
+    for entry in dialogs.iter_messages(messages_paths):
         total += 1
         if entry.get("transcribed"):
             transcribed += 1
@@ -314,7 +314,7 @@ def iter_dialog_export(dialog_id: str):
         "",
     ])
 
-    for entry in dialogs.iter_messages(messages_path):
+    for entry in dialogs.iter_messages(messages_paths):
         yield _format_dm_entry(entry, me_label, peer_label) + "\n"
 
     yield f"\n{sep}\n"

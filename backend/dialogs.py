@@ -7,9 +7,12 @@ chat reads as one continuous transcript.
 
 Two memory rules drive the design:
 
-  * Messages are pulled and written in chunks of DM_CHUNK_SIZE. Entries are
-    appended to messages.jsonl as they are produced and never accumulated in a
-    dict, so a chat of any length costs the same memory.
+  * Messages are pulled and processed in chunks of DM_CHUNK_SIZE. Each chunk
+    is written to its own JSONL part under chunks/ (see chunk_store.py) and
+    never accumulated in a dict, so a chat of any length costs the same
+    memory — and an interrupted run keeps every chunk it already finished.
+    At the end of a successful run the parts are merged into one
+    messages.jsonl, which is what the exporters read.
   * Voice/round media is downloaded into a temporary directory and kept there
     for the whole run — the chat is only considered processed once every chunk
     is done, and only then is the directory removed.
@@ -30,7 +33,7 @@ from telethon.tl.types import (
     MessageService,
 )
 
-from . import transcriber
+from . import chunk_store, transcriber
 from .config import API_HASH, API_ID, DATA_DIR, DM_CHUNK_SIZE, SESSION_PATH
 from .models import ParseStats
 from .utils import display_name, resolve_dialog, start_client
@@ -39,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[..., Awaitable[None]]
 
-MESSAGES_FILE = "messages.jsonl"
+MESSAGES_FILE = chunk_store.MERGED_FILE
 INFO_FILE = "info.json"
 
 # Plain text messages fly by; media messages are slow and each one deserves an
@@ -272,81 +275,91 @@ async def parse_dialog(
                           detail="загружаю модель распознавания")
         await transcriber.warm_up()
 
-        messages_path = out_dir / MESSAGES_FILE
         current = 0
         chunk: list = []
+        # ChunkWriter wipes chunks/ on creation, so a fresh run never inherits
+        # parts of the previous one.
+        writer = chunk_store.ChunkWriter(out_dir)
 
-        # Truncate any previous run before streaming this one in.
-        with messages_path.open("w", encoding="utf-8") as sink:
+        async def flush(chunk_messages: list) -> None:
+            """Process one chunk end to end, then let it go out of scope."""
+            nonlocal current
 
-            sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-
-            async def flush(chunk_messages: list) -> None:
-                """Process one chunk end to end, then let it go out of scope."""
-                nonlocal current
-
-                # Start every download in this chunk up front. Downloading is
-                # network-bound and recognition is compute-bound, so they run at
-                # the same time: while the model works on one voice message, the
-                # next ones are already arriving.
-                downloads = {
-                    msg.id: asyncio.create_task(
-                        _download_media(client, msg, tmp_dir, sem, stats_out)
-                    )
-                    for msg in chunk_messages
-                    if _voice_kind(msg)
-                }
-
-                try:
-                    for msg in chunk_messages:
-                        current += 1
-
-                        async def report(stage: str, detail: str) -> None:
-                            await progress_cb(current, total, stats_out,
-                                              stage=stage, detail=detail)
-
-                        entry = await _process_message(
-                            client, msg, tmp_dir, me.id, stats_out,
-                            report=report, download=downloads.get(msg.id),
-                        )
-                        stats_out.total_posts += 1
-                        if entry is None:
-                            stats_out.skipped_posts += 1
-                        else:
-                            sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                            stats_out.saved_posts += 1
-
-                        # Media messages already reported themselves; text is
-                        # cheap enough that a periodic tick is plenty.
-                        if entry is not None and entry["kind"] != "text":
-                            sink.flush()
-                            await progress_cb(current, total, stats_out, stage="scanning")
-                        elif current % TEXT_PROGRESS_EVERY == 0:
-                            await progress_cb(current, total, stats_out, stage="scanning")
-                finally:
-                    # On cancellation the prefetch must not outlive the run.
-                    for task in downloads.values():
-                        if not task.done():
-                            task.cancel()
-
-                sink.flush()
-                await progress_cb(current, total, stats_out, stage="scanning")
-                logger.info(
-                    "Chunk done: %s/%s processed, saved=%s transcribed=%s (%ss of %ss speech)",
-                    current, total, stats_out.saved_posts, stats_out.transcribed_count,
-                    stats_out.transcribed_seconds, stats_out.voice_seconds,
+            # Start every download in this chunk up front. Downloading is
+            # network-bound and recognition is compute-bound, so they run at
+            # the same time: while the model works on one voice message, the
+            # next ones are already arriving.
+            downloads = {
+                msg.id: asyncio.create_task(
+                    _download_media(client, msg, tmp_dir, sem, stats_out)
                 )
+                for msg in chunk_messages
+                if _voice_kind(msg)
+            }
 
-            # With reverse=True, offset_date makes Telegram start at that moment
-            # and walk forward, so older history is never fetched.
+            try:
+                for msg in chunk_messages:
+                    current += 1
+
+                    async def report(stage: str, detail: str) -> None:
+                        await progress_cb(current, total, stats_out,
+                                          stage=stage, detail=detail)
+
+                    entry = await _process_message(
+                        client, msg, tmp_dir, me.id, stats_out,
+                        report=report, download=downloads.get(msg.id),
+                    )
+                    stats_out.total_posts += 1
+                    if entry is None:
+                        stats_out.skipped_posts += 1
+                    else:
+                        writer.write(entry)
+                        stats_out.saved_posts += 1
+
+                    # Media messages already reported themselves; text is
+                    # cheap enough that a periodic tick is plenty.
+                    if entry is not None and entry["kind"] != "text":
+                        writer.flush()
+                        await progress_cb(current, total, stats_out, stage="scanning")
+                    elif current % TEXT_PROGRESS_EVERY == 0:
+                        await progress_cb(current, total, stats_out, stage="scanning")
+            finally:
+                # On cancellation the prefetch must not outlive the run.
+                for task in downloads.values():
+                    if not task.done():
+                        task.cancel()
+
+            writer.flush()
+            await progress_cb(current, total, stats_out, stage="scanning")
+            logger.info(
+                "Chunk done: %s/%s processed, saved=%s transcribed=%s (%ss of %ss speech)",
+                current, total, stats_out.saved_posts, stats_out.transcribed_count,
+                stats_out.transcribed_seconds, stats_out.voice_seconds,
+            )
+
+        sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+        # With reverse=True, offset_date makes Telegram start at that moment
+        # and walk forward, so older history is never fetched.
+        first_of_chunk = None
+        try:
             async for message in client.iter_messages(entity, reverse=True, offset_date=since):
+                if not chunk:
+                    first_of_chunk = message.id
                 chunk.append(message)
                 if len(chunk) >= DM_CHUNK_SIZE:
+                    writer.start_chunk(first_of_chunk)
                     await flush(chunk)
                     chunk = []
 
             if chunk:
+                writer.start_chunk(first_of_chunk)
                 await flush(chunk)
+        finally:
+            writer.close()
+
+        # All parts are on disk — fold them into the single merged transcript.
+        chunk_store.merge_chunks(out_dir)
 
         await progress_cb(current, total, stats_out)
         logger.info(
@@ -357,7 +370,7 @@ async def parse_dialog(
 
     except asyncio.CancelledError:
         # Stopped from the UI: a half-parsed chat is not useful, and the run
-        # truncated messages.jsonl on start anyway, so drop the whole directory.
+        # rewrites all chunk parts on start anyway, so drop the whole directory.
         if out_dir is not None:
             shutil.rmtree(out_dir, ignore_errors=True)
             logger.info("DM parse cancelled — removed partial data: %s", out_dir)
@@ -387,17 +400,32 @@ def iter_messages(messages_path: Path):
     Yield transcript entries one at a time, in chronological order.
 
     Reading stays streaming so exporting a long chat costs no more memory than
-    parsing it did.
+    parsing it did. Accepts either the merged file or a list of chunk parts.
     """
-    with messages_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed line in %s", messages_path)
+    paths = [messages_path] if isinstance(messages_path, Path) else messages_path
+    for path in paths:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("Skipping malformed line in %s", path)
+
+
+def dialog_message_paths(out_dir: Path) -> list[Path]:
+    """
+    Files to read a dialog's transcript from.
+
+    Prefers the merged messages.jsonl; falls back to the chunk parts when the
+    merge was lost or interrupted (the chunks are the backup copy).
+    """
+    merged = out_dir / MESSAGES_FILE
+    if merged.exists():
+        return [merged]
+    return chunk_store.list_chunk_paths(out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -446,10 +474,10 @@ def list_parsed_dialogs() -> list[dict]:
 
         messages = 0
         transcribed = 0
-        messages_path = d / MESSAGES_FILE
-        if messages_path.exists():
+        paths = dialog_message_paths(d)
+        if paths:
             # Counted line by line: never loads the chat into memory.
-            for entry in iter_messages(messages_path):
+            for entry in iter_messages(paths):
                 messages += 1
                 if entry.get("transcribed"):
                     transcribed += 1

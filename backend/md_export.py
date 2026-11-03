@@ -56,9 +56,9 @@ def iter_dialog_markdown(dialog_id: str):
     """Yield a dialogue transcript as Markdown, oldest message first."""
     out_dir = dialogs.dialog_dir(dialog_id)
     info_path = out_dir / dialogs.INFO_FILE
-    messages_path = out_dir / dialogs.MESSAGES_FILE
+    messages_paths = dialogs.dialog_message_paths(out_dir)
 
-    if not info_path.exists() or not messages_path.exists():
+    if not info_path.exists() or not messages_paths:
         raise FileNotFoundError(f"Dialog data not found for id={dialog_id}")
 
     with info_path.open(encoding="utf-8") as f:
@@ -72,7 +72,7 @@ def iter_dialog_markdown(dialog_id: str):
     # is walked twice rather than held in memory.
     total = voice = notes = transcribed = 0
     first_date = last_date = ""
-    for entry in dialogs.iter_messages(messages_path):
+    for entry in dialogs.iter_messages(messages_paths):
         total += 1
         kind = entry.get("kind")
         if kind == "voice":
@@ -134,7 +134,7 @@ def iter_dialog_markdown(dialog_id: str):
     yield "---\n\n## Переписка\n\n"
 
     current_date = None
-    for entry in dialogs.iter_messages(messages_path):
+    for entry in dialogs.iter_messages(messages_paths):
         date, time = _split_dt(entry.get("date"))
         if date and date != current_date:
             current_date = date
