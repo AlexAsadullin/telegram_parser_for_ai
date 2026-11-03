@@ -141,6 +141,35 @@ else
 fi
 info "База данных готова: ${_dbmsg}"
 
+# --- GPU (linux branch) ---------------------------------------------------
+# Detect an AMD Radeon (RX 580 / gfx803) and, if ROCm is missing or broken,
+# print a concrete setup plan instead of silently running on CPU.
+gpu_status=$(TG_API_ID=dummy TG_API_HASH=dummy venv/bin/python -c '
+import sys; sys.path.insert(0, ".")
+from backend import gpu_detect as g
+plan = g.setup_plan()
+kind = plan.get("kind", "")
+print(kind)
+if kind == "setup_required":
+    for s in plan.get("steps", []):
+        print("  • " + s)
+    for c in plan.get("script", []):
+        print("    $ " + c)
+' 2>/dev/null || true)
+gpu_kind="${gpu_status%%$'\n'*}"
+case "$gpu_kind" in
+    ready)
+        info "GPU готов к транскрибации (ROCm/HIP активен)" ;;
+    setup_required)
+        printf '\n\033[33mНайдена видеокарта AMD, но ROCm не настроен — транскрибация пойдёт на CPU.\033[0m\n'
+        printf '%s\n' "${gpu_status#*$'\n'}"
+        printf '\033[36mПосле установки ROCm/torch перезапустите ./run.sh — GPU определится автоматически.\033[0m\n\n' ;;
+    passthrough)
+        printf '\n\033[33m%s\033[0m\n\n' "$(printf '%s' "$gpu_status" | tail -n +2 | head -n2)" ;;
+    no_amd_gpu|*)
+        : ;; # silent when there is no AMD card here
+esac
+
 if [ "$SETUP_ONLY" -eq 1 ]; then
     printf '\n\033[32m  Готово.\033[0m  Окружение настроено: venv/, .env, node_modules, база данных.\n'
     printf '           Запустите серверы командой: ./run.sh\n\n'

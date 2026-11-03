@@ -334,8 +334,7 @@ async def warm_up() -> None:
 
 def model_info() -> dict:
     """Describe the configured engine without forcing the model to load."""
-    backend = _backend or ("mlx" if (WHISPER_BACKEND in ("auto", "mlx") and _mlx_available())
-                           else "faster-whisper")
+    backend = _backend or _resolve_backend_preview()
     if backend == "mlx":
         device, compute, gpu = "Apple GPU (MLX)", "float16", True
     elif _model is not None:  # loaded — report what actually won
@@ -346,7 +345,7 @@ def model_info() -> dict:
         gpu = device != "cpu"
         if WHISPER_COMPUTE_TYPE not in ("", "auto"):
             compute = WHISPER_COMPUTE_TYPE
-    return {
+    info = {
         "backend": backend,
         "model": _mlx_repo(WHISPER_MODEL) if backend == "mlx" else WHISPER_MODEL,
         "device": device,
@@ -355,3 +354,30 @@ def model_info() -> dict:
         "language": WHISPER_LANGUAGE,
         "loaded": _model is not None,
     }
+    # On this linux branch: when an AMD GPU exists but ROCm isn't usable,
+    # expose why + how to fix it so the UI/CLI can show actionable steps.
+    try:
+        from . import gpu_detect
+
+        if (not gpu and device == "cpu"
+                and gpu_detect.amd_gpu_present()):
+            plan = gpu_detect.setup_plan()
+            info["amd_setup_required"] = plan.get("kind") == "setup_required"
+            info["amd_passthrough"] = plan.get("kind") == "passthrough"
+            info["amd_polaris"] = plan.get("polaris", False)
+            info["setup_steps"] = plan.get("steps", [])
+    except Exception:
+        pass
+    return info
+
+
+def _resolve_backend_preview() -> str:
+    """Cheap version of _resolve_backend for status endpoints (no model load)."""
+    if WHISPER_BACKEND in ("mlx", "faster-whisper", "whisper-torch"):
+        return WHISPER_BACKEND
+    if _mlx_available():
+        return "mlx"
+    device, _ = detect_device(WHISPER_DEVICE)
+    if device == "rocm" and whisper_on_torch_available():
+        return "whisper-torch"
+    return "faster-whisper"
