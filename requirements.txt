@@ -12,7 +12,6 @@ pydantic==2.13.4
 # CPU-only: CTranslate2 has no Metal backend and this wheel has no CUDA.
 faster-whisper==1.2.1
 
-# Apple Silicon GPU backend. Optional — WHISPER_BACKEND=auto falls back to
-# faster-whisper on CPU if this is missing (e.g. on Linux/Windows).
-# Measured on an M2 Air: 2.6x faster than the CPU path.
+# Apple Silicon GPU backend. На ветке mac это основной движок по умолчанию
+# (WHISPER_BACKEND=mlx). Обязателен на macOS с M-серией чипов.
 mlx-whisper==0.4.3 ; sys_platform == "darwin" and platform_machine == "arm64"

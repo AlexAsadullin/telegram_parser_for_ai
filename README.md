@@ -72,32 +72,24 @@ BACKEND_PORT=8001 FRONTEND_PORT=5174 ./run.sh    # другие порты
 | Слой | Технологии |
 |---|---|
 | Backend | Python 3.13, FastAPI 0.141, Telethon 1.44, aiosqlite, uvicorn |
-| Распознавание речи | GPU по умолчанию (MLX/CUDA/ROCm) или faster-whisper (CPU), модель `small` |
+| Распознавание речи | По умолчанию MLX — GPU Apple M-серии (ветка `mac`), деград на faster-whisper (CPU) |
 | Frontend | React 19, Vite 8, Axios |
 | Хранение | JSON / JSONL-файлы + SQLite |
 
-### Распознавание речи: GPU по умолчанию
+### Распознавание речи: MLX по умолчанию (ветка `mac`)
 
-Два движка, выбор автоматический (`WHISPER_BACKEND=auto`, `WHISPER_DEVICE=auto`).
-На этой ветке **по умолчанию используется GPU**, если он доступен; CPU — только
-когда сканирование не нашло ничего пригодного (или когда GPU-инициализация
-упала — тогда идёт тихий деград на `cpu int8`, а не падение всей транскрибации).
+Эта ветка рассчитана на macOS с чипами M-серии. Движок по умолчанию —
+**mlx-whisper** (`WHISPER_BACKEND=mlx`, `WHISPER_DEVICE=mps`): Whisper считается
+на встроенном GPU Apple. Если MLX недоступен (нет `mlx_whisper` или не Apple
+Silicon), включается громкое предупреждение и деград на faster-whisper CPU —
+парсинг никогда не падает из-за транскрибации.
+
+Для Linux/NVIDIA/AMD используйте ветку `linux` (GPU-зонд CUDA/ROCm).
 
 | Движок | Устройство | Когда используется |
 |---|---|---|
-| **mlx-whisper** | GPU Apple M-серии | Apple Silicon |
-| **faster-whisper** | CUDA (NVIDIA) | NVIDIA-карты, колёса CTranslate2 из коробки |
-| **faster-whisper** | ROCm/HIP (AMD) | AMD GPU, например Radeon RX 580 (Polaris/gfx803) — требует сборки ctranslate2/torch с ROCm |
-| **faster-whisper** | CPU | Если GPU нет или не подтвердился |
-
-Автоскан (`backend/gpu_detect.py`) выполняется один раз за процесс: сначала
-пробуется CUDA через `ctranslate2.get_cuda_device_count()`, затем ROCm через
-`torch.version.hip`. Результат — `(device, compute_type)`; для GPU берётся
-`float16`, для CPU — `int8`.
-
-Про AMD Radeon RX 580: Polaris официально не поддерживается ROCm, но работает
-через форк ROCm-runtime для gfx803 / ZenDNN. Поэтому код и пытается GPU, и
-гарантированно не роняет парсинг, если сборка библиотек не подошла.
+| **mlx-whisper** | GPU Apple M-серии | По умолчанию на этой ветке |
+| **faster-whisper** | CPU int8 | Деград, если MLX недоступен |
 
 Замер на **MacBook Air M2**, 30 с русской речи, модель `small`:
 
@@ -109,7 +101,7 @@ BACKEND_PORT=8001 FRONTEND_PORT=5174 ./run.sh    # другие порты
 Какой движок активен, видно в интерфейсе (бейдж под полем ввода) и в `GET /api/asr-model`.
 
 Принудительный выбор: `WHISPER_BACKEND=faster-whisper` или `WHISPER_BACKEND=mlx`;
-устройство — `WHISPER_DEVICE=cpu|cuda|rocm|auto`.
+устройство — `WHISPER_DEVICE=mps|cpu|cuda|rocm|auto`.
 
 ### Почему `small`
 
@@ -198,13 +190,13 @@ DATA_DIR=data
 DB_PATH=backend/history.db
 
 # Локальное распознавание речи (личные сообщения). Тоже опционально.
-# auto = предпочитает GPU (MLX/CUDA/ROCm), иначе CPU
-WHISPER_BACKEND=auto
+# На ветке mac по умолчанию mlx — GPU Apple M-серии; деград на faster-whisper CPU
+WHISPER_BACKEND=mlx
 WHISPER_MODEL=small
 WHISPER_LANGUAGE=ru
 
-# auto = автоскан GPU при старте; принудительно cpu | cuda | rocm
-WHISPER_DEVICE=auto
+# mps = Apple GPU через MLX; для CTranslate2: cpu | cuda | rocm | auto
+WHISPER_DEVICE=mps
 # auto = float16 на GPU, int8 на CPU
 WHISPER_COMPUTE_TYPE=auto
 

@@ -36,16 +36,15 @@ DB_PATH: str = str(_resolve(os.getenv("DB_PATH", "backend/history.db")))
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "ru")
 
-# Engine: "auto" prefers a GPU — Apple MLX on M-series, CUDA via
-# faster-whisper/CTranslate2 on NVIDIA, ROCm/HIP on AMD (Radeon RX 580) —
-# and falls back to CPU when nothing usable is found.
-# Force with "mlx" or "faster-whisper".
-WHISPER_BACKEND: str = os.getenv("WHISPER_BACKEND", "auto")
+# Engine: on the `mac` branch the default is "mlx" — Apple MLX runs Whisper
+# on the GPU of M-series chips. Set WHISPER_BACKEND=auto (or "faster-whisper")
+# in .env to force the CTranslate2 path instead; auto still prefers MLX here.
+WHISPER_BACKEND: str = os.getenv("WHISPER_BACKEND", "mlx")
 
-# Device for the faster-whisper backend. Default "auto" probes the machine at
-# startup (see gpu_detect.py): on this branch the GPU is preferred whenever it
-# answers the probe. Force with "cpu", "cuda" or "rocm" in .env.
-WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "auto")
+# Device for the faster-whisper backend. "mps" maps to the Apple GPU through
+# MLX; for the CTranslate2 fallback use "cpu" (default here) or "auto" to run
+# the CUDA/ROCm probe from gpu_detect.py.
+WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "mps")
 # Compute type override; "auto" picks float16 on GPU, int8 on CPU.
 WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
 

@@ -64,11 +64,20 @@ def _mlx_available() -> bool:
 def _resolve_backend() -> str:
     """Decide which engine to use. Called once, under the load lock."""
     if WHISPER_BACKEND == "mlx":
-        return "mlx"
+        # `mac` branch default: Apple MLX is the GPU. If it cannot be used
+        # (no mlx_whisper installed / no Apple GPU), degrade loudly instead
+        # of failing every voice message.
+        if _mlx_available():
+            return "mlx"
+        logger.warning(
+            "WHISPER_BACKEND=mlx but MLX is unavailable — falling back to "
+            "faster-whisper (CPU)"
+        )
+        return "faster-whisper"
     if WHISPER_BACKEND == "faster-whisper":
         return "faster-whisper"
 
-    # auto
+    # auto — on this branch still prefers MLX as the GPU path
     if _mlx_available():
         return "mlx"
     logger.info("MLX unavailable — falling back to faster-whisper on CPU")
@@ -98,10 +107,13 @@ def _load() -> tuple[str, object]:
         else:
             from faster_whisper import WhisperModel
 
-            # GPU by default on this branch: "auto" probes for CUDA/ROCm and
-            # only settles on CPU when nothing answers. An explicit
-            # WHISPER_DEVICE in .env still wins.
-            device, probed_compute = detect_device(WHISPER_DEVICE)
+            # `mac` branch: MLX is the GPU path; the CTranslate2 fallback
+            # runs on CPU by default. "mps" (the branch default) means the
+            # Apple GPU via MLX, which CTranslate2 cannot use — map it to
+            # cpu here. WHISPER_DEVICE=auto still probes CUDA/ROCm, and an
+            # explicit cpu/cuda/rocm wins.
+            device_cfg = "cpu" if WHISPER_DEVICE == "mps" else WHISPER_DEVICE
+            device, probed_compute = detect_device(device_cfg)
             compute_type = (
                 WHISPER_COMPUTE_TYPE
                 if WHISPER_COMPUTE_TYPE not in ("", "auto")
@@ -294,7 +306,8 @@ def model_info() -> dict:
         device, compute = _device_in_use, _compute_in_use
         gpu = device != "cpu"
     else:  # not loaded yet — report what the probe predicts
-        device, compute = detect_device(WHISPER_DEVICE)
+        device_cfg = "cpu" if WHISPER_DEVICE == "mps" else WHISPER_DEVICE
+        device, compute = detect_device(device_cfg)
         gpu = device != "cpu"
         if WHISPER_COMPUTE_TYPE not in ("", "auto"):
             compute = WHISPER_COMPUTE_TYPE
