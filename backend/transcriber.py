@@ -1,29 +1,34 @@
 """
 Local speech-to-text for voice messages and round video notes.
 
-Two backends, because the right one depends on the machine:
+Three engines; the right one depends on the machine:
 
-  * mlx      — Apple MLX, runs on the GPU of M-series chips. Measured on an
-               M2 Air: 30s of Russian speech in 1.6s (~19x realtime), about
-               2.6x faster than the CPU path.
-  * faster-whisper — CTranslate2. Uses CUDA on NVIDIA; on AMD GPUs (Radeon RX
-               580, gfx803) it runs through the ROCm/HIP stack when a matching
-               ctranslate2/torch build is installed. Falls back to CPU.
+  * mlx            — Apple MLX on the GPU of M-series chips. Measured on an
+                     M2 Air: 30 s of Russian speech in 1.6 s.
+  * whispercpp     — whisper.cpp (pywhispercpp binding) with the Vulkan
+                     backend. This is the GPU path for AMD cards, including
+                     the Radeon RX 580 (Polaris) that ROCm no longer supports.
+                     Measured on an RX 580: 46 s of speech in ~3 s.
+  * faster-whisper — CTranslate2. CUDA on NVIDIA, otherwise CPU int8.
 
-"auto" (the default) picks mlx when it imports, otherwise probes for a CUDA or
-ROCm GPU (gpu_detect.py) and uses it; only when nothing answers does it settle
-on the CPU. On this branch the GPU is the default whenever it is usable.
+"auto" (the default) tries them in that order. whisper.cpp is only kept when
+it really attached to a GPU; if Vulkan initialisation falls back to the CPU,
+faster-whisper takes over because its int8 CPU path is faster than
+whisper.cpp's.
 
-Audio is always decoded with PyAV, including for the MLX backend whose own
-loader would otherwise shell out to an ffmpeg binary. That keeps ffmpeg out of
+Audio is always decoded with PyAV, for every engine. That keeps ffmpeg out of
 the dependency list and lets round video notes (.mp4) be read directly — only
 the audio stream is taken, the video is ignored.
 """
 import asyncio
 import logging
+import os
+import re
+import tempfile
 import threading
 from pathlib import Path
 
+from . import gpu_detect
 from .config import (
     WHISPER_BACKEND,
     WHISPER_COMPUTE_TYPE,
@@ -31,7 +36,6 @@ from .config import (
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
 )
-from .gpu_detect import detect_device, whisper_on_torch_available
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,10 @@ _backend: str | None = None
 _device_in_use: str = "cpu"
 _compute_in_use: str = "int8"
 _model_lock = threading.Lock()
+# whisper.cpp contexts are not thread-safe; serialise inference on them.
+_infer_lock = threading.Lock()
+
+_CPU_THREADS = max(1, min(8, os.cpu_count() or 4))
 
 
 def _mlx_repo(model: str) -> str:
@@ -61,35 +69,84 @@ def _mlx_available() -> bool:
         return False
 
 
-def _resolve_backend() -> str:
-    """Decide which engine to use. Called once, under the load lock."""
-    if WHISPER_BACKEND == "mlx":
-        return "mlx"
-    if WHISPER_BACKEND == "faster-whisper":
-        return "faster-whisper"
-    if WHISPER_BACKEND == "whisper-torch":
-        return "whisper-torch"
+def _whispercpp_importable() -> bool:
+    try:
+        import pywhispercpp.model  # noqa: F401
 
-    # auto — on this `linux` branch the GPU is the default whenever it is
-    # usable. AMD ROCm (Radeon RX 580) cannot be served by CTranslate2, so
-    # when the probe finds a HIP device we route through openai-whisper on
-    # torch+ROCm instead of silently staying on CPU.
-    if _mlx_available():
-        return "mlx"
-    device, _ = detect_device(WHISPER_DEVICE)
-    if device == "rocm":
-        if whisper_on_torch_available():
-            logger.info("AMD ROCm GPU detected — using openai-whisper on torch+HIP")
-            return "whisper-torch"
-        logger.warning(
-            "ROCm GPU found but openai-whisper/torch not installed — "
-            "using faster-whisper (%s)", device,
+        return True
+    except Exception:
+        return False
+
+
+def _load_whispercpp():
+    """Load whisper.cpp and report which device it attached to.
+
+    Returns (model, device_label). device_label is None when whisper.cpp ended
+    up on the CPU — the caller then prefers faster-whisper instead.
+    """
+    from pywhispercpp.model import Model
+
+    fd, log_path = tempfile.mkstemp(prefix="whispercpp_", suffix=".log")
+    os.close(fd)
+    try:
+        model = Model(
+            WHISPER_MODEL,
+            redirect_whispercpp_logs_to=log_path,
+            print_progress=False,
+            print_realtime=False,
+            print_timestamps=False,
+            n_threads=_CPU_THREADS,
         )
-    if device != "cpu":
-        logger.info("GPU detected for transcription: %s", device)
+        with open(log_path, errors="replace") as fh:
+            log = fh.read()
+    finally:
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
+
+    # whisper.cpp logs e.g.
+    #   ggml_vulkan: 0 = AMD Radeon RX 580 2048SP (RADV POLARIS10) (radv) | ...
+    #   whisper_backend_init_gpu: using Vulkan0 backend
+    used = re.search(r"using (\w+?)(\d*) backend", log)
+    if not used or used.group(1).upper() == "CPU":
+        return model, None
+    name = re.search(r"ggml_vulkan: \d+ = ([^|(]+)", log)
+    label = f"{used.group(1)} ({name.group(1).strip()})" if name else used.group(1)
+    return model, label
+
+
+def _load_faster_whisper():
+    from faster_whisper import WhisperModel
+
+    if WHISPER_DEVICE in ("cpu", "cuda"):
+        device = WHISPER_DEVICE
     else:
-        logger.info("MLX unavailable — falling back to faster-whisper on CPU")
-    return "faster-whisper"
+        device = "cuda" if gpu_detect.cuda_available() else "cpu"
+    if WHISPER_COMPUTE_TYPE not in ("", "auto"):
+        compute = WHISPER_COMPUTE_TYPE
+    else:
+        compute = "float16" if device == "cuda" else "int8"
+
+    logger.info(
+        "Using faster-whisper on %s (compute_type=%s), model %r",
+        device, compute, WHISPER_MODEL,
+    )
+    try:
+        model = WhisperModel(
+            WHISPER_MODEL, device=device, compute_type=compute,
+            cpu_threads=_CPU_THREADS,
+        )
+    except Exception as exc:
+        if device == "cpu":
+            raise
+        logger.warning("CUDA init failed (%s) — falling back to CPU int8", exc)
+        device, compute = "cpu", "int8"
+        model = WhisperModel(
+            WHISPER_MODEL, device=device, compute_type=compute,
+            cpu_threads=_CPU_THREADS,
+        )
+    return model, device, compute
 
 
 def _load() -> tuple[str, object]:
@@ -102,77 +159,48 @@ def _load() -> tuple[str, object]:
         if _model is not None:  # another thread won the race
             return _backend, _model
 
-        backend = _resolve_backend()
+        choice = WHISPER_BACKEND
+        if choice == "auto":
+            if _mlx_available():
+                choice = "mlx"
+            elif _whispercpp_importable() and gpu_detect.vulkan_gpu_likely():
+                choice = "whispercpp"
+            else:
+                choice = "faster-whisper"
 
-        if backend == "mlx":
-            import mlx_whisper
-
+        if choice == "mlx":
             repo = _mlx_repo(WHISPER_MODEL)
             logger.info("Using MLX backend on Apple GPU, model %r", repo)
-            # MLX loads lazily on first transcribe and caches internally;
-            # the repo id is all we need to carry around.
-            _model = repo
-        elif backend == "whisper-torch":
-            # AMD ROCm path (Radeon RX 580): CTranslate2 has no HIP backend,
-            # so run openai-whisper directly on torch+ROCm.
-            import whisper
+            # MLX loads lazily on first transcribe; the repo id is enough.
+            _model, _backend = repo, "mlx"
+            _device_in_use, _compute_in_use = "Apple GPU (MLX)", "float16"
+            return _backend, _model
 
-            device, _ = detect_device(WHISPER_DEVICE)
-            logger.info(
-                "Using openai-whisper on torch (%s), model %r",
-                device, WHISPER_MODEL,
-            )
+        if choice == "whispercpp":
             try:
-                _model = whisper.load_model(WHISPER_MODEL, device=device)
+                model, label = _load_whispercpp()
             except Exception as exc:
+                logger.warning("whisper.cpp failed to load (%s) — using faster-whisper", exc)
+                model, label = None, None
+            if label is not None or (model is not None and WHISPER_BACKEND == "whispercpp"):
+                logger.info(
+                    "Using whisper.cpp on %s, model %r",
+                    label or "CPU", WHISPER_MODEL,
+                )
+                _model, _backend = model, "whispercpp"
+                _device_in_use = label or "cpu"
+                _compute_in_use = "float16" if label else "float32"
+                return _backend, _model
+            if model is not None:
                 logger.warning(
-                    "openai-whisper on %s failed (%s) — falling back to "
-                    "faster-whisper CPU int8", device, exc,
+                    "whisper.cpp did not attach to a GPU (Vulkan) — "
+                    "faster-whisper on CPU is quicker, switching to it",
                 )
-                from faster_whisper import WhisperModel
+                del model
 
-                _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-                backend = "faster-whisper"
-            _device_in_use = device
-            _compute_in_use = "float16" if device != "cpu" else "int8"
-        else:
-            from faster_whisper import WhisperModel
-
-            # GPU by default on this branch: "auto" probes for CUDA/ROCm and
-            # only settles on CPU when nothing answers. An explicit
-            # WHISPER_DEVICE in .env still wins.
-            device, probed_compute = detect_device(WHISPER_DEVICE)
-            compute_type = (
-                WHISPER_COMPUTE_TYPE
-                if WHISPER_COMPUTE_TYPE not in ("", "auto")
-                else probed_compute
-            )
-            logger.info(
-                "Using faster-whisper on %s (compute_type=%s), model %r",
-                device, compute_type, WHISPER_MODEL,
-            )
-            try:
-                _model = WhisperModel(
-                    WHISPER_MODEL, device=device, compute_type=compute_type,
-                )
-            except Exception as exc:
-                if device == "cpu":
-                    raise
-                # ROCm/CUDA build mismatch (e.g. plain ctranslate2 wheel on an
-                # AMD card): never lose the run — degrade to CPU with a loud
-                # warning instead of failing every voice message.
-                logger.warning(
-                    "GPU init failed (%s: %s) — falling back to CPU int8",
-                    device, exc,
-                )
-                device, compute_type = "cpu", "int8"
-                _model = WhisperModel(
-                    WHISPER_MODEL, device=device, compute_type=compute_type,
-                )
-            _device_in_use = device
-            _compute_in_use = compute_type
-
-        _backend = backend
+        model, device, compute = _load_faster_whisper()
+        _model, _backend = model, "faster-whisper"
+        _device_in_use, _compute_in_use = device, compute
         return _backend, _model
 
 
@@ -285,13 +313,10 @@ def _transcribe_sync(path: str) -> str:
         )
         return (result.get("text") or "").strip()
 
-    if backend == "whisper-torch":
-        # openai-whisper expects float32 numpy and runs on the torch device
-        # (HIP for the RX 580) chosen at load time. fp16 is safe on this GPU.
-        result = model.transcribe(
-            audio, language=WHISPER_LANGUAGE, fp16=True, verbose=None
-        )
-        return (result.get("text") or "").strip()
+    if backend == "whispercpp":
+        with _infer_lock:
+            segments = model.transcribe(audio, language=WHISPER_LANGUAGE)
+        return " ".join(s.text.strip() for s in segments).strip()
 
     segments, _info = model.transcribe(audio, language=WHISPER_LANGUAGE, beam_size=1)
     # `segments` is a generator; consuming it is what actually runs inference.
@@ -332,20 +357,31 @@ async def warm_up() -> None:
         logger.warning("Model warm-up failed: %s", exc)
 
 
+def _preview() -> tuple[str, str, bool, str]:
+    """Predict (backend, device, gpu, compute) without loading a model."""
+    choice = WHISPER_BACKEND
+    if choice in ("auto", "mlx") and _mlx_available():
+        return "mlx", "Apple GPU (MLX)", True, "float16"
+    if choice in ("auto", "whispercpp") and _whispercpp_importable():
+        if gpu_detect.vulkan_gpu_likely():
+            name = gpu_detect.gpu_name() or "GPU"
+            return "whispercpp", f"Vulkan ({name})", True, "float16"
+        if choice == "whispercpp":
+            return "whispercpp", "cpu", False, "float32"
+    if WHISPER_DEVICE == "cuda" or (WHISPER_DEVICE != "cpu" and gpu_detect.cuda_available()):
+        return "faster-whisper", "cuda", True, "float16"
+    compute = WHISPER_COMPUTE_TYPE if WHISPER_COMPUTE_TYPE not in ("", "auto") else "int8"
+    return "faster-whisper", "cpu", False, compute
+
+
 def model_info() -> dict:
     """Describe the configured engine without forcing the model to load."""
-    backend = _backend or _resolve_backend_preview()
-    if backend == "mlx":
-        device, compute, gpu = "Apple GPU (MLX)", "float16", True
-    elif _model is not None:  # loaded — report what actually won
-        device, compute = _device_in_use, _compute_in_use
+    if _model is not None:  # loaded — report what actually won
+        backend, device, compute = _backend, _device_in_use, _compute_in_use
         gpu = device != "cpu"
-    else:  # not loaded yet — report what the probe predicts
-        device, compute = detect_device(WHISPER_DEVICE)
-        gpu = device != "cpu"
-        if WHISPER_COMPUTE_TYPE not in ("", "auto"):
-            compute = WHISPER_COMPUTE_TYPE
-    info = {
+    else:
+        backend, device, gpu, compute = _preview()
+    return {
         "backend": backend,
         "model": _mlx_repo(WHISPER_MODEL) if backend == "mlx" else WHISPER_MODEL,
         "device": device,
@@ -354,30 +390,3 @@ def model_info() -> dict:
         "language": WHISPER_LANGUAGE,
         "loaded": _model is not None,
     }
-    # On this linux branch: when an AMD GPU exists but ROCm isn't usable,
-    # expose why + how to fix it so the UI/CLI can show actionable steps.
-    try:
-        from . import gpu_detect
-
-        if (not gpu and device == "cpu"
-                and gpu_detect.amd_gpu_present()):
-            plan = gpu_detect.setup_plan()
-            info["amd_setup_required"] = plan.get("kind") == "setup_required"
-            info["amd_passthrough"] = plan.get("kind") == "passthrough"
-            info["amd_polaris"] = plan.get("polaris", False)
-            info["setup_steps"] = plan.get("steps", [])
-    except Exception:
-        pass
-    return info
-
-
-def _resolve_backend_preview() -> str:
-    """Cheap version of _resolve_backend for status endpoints (no model load)."""
-    if WHISPER_BACKEND in ("mlx", "faster-whisper", "whisper-torch"):
-        return WHISPER_BACKEND
-    if _mlx_available():
-        return "mlx"
-    device, _ = detect_device(WHISPER_DEVICE)
-    if device == "rocm" and whisper_on_torch_available():
-        return "whisper-torch"
-    return "faster-whisper"

@@ -9,7 +9,7 @@ pydantic==2.13.4
 # Local speech recognition for private messages (voice + round video notes).
 # Pulls in ctranslate2, av (PyAV), tokenizers, onnxruntime and numpy.
 # PyAV also decodes the audio track of .mp4 video notes, so no ffmpeg needed.
-# CPU-only: CTranslate2 has no Metal backend and this wheel has no CUDA.
+# CPU int8 everywhere; CUDA on NVIDIA. CTranslate2 has no Vulkan/ROCm backend.
 faster-whisper==1.2.1
 
 # Apple Silicon GPU backend. Optional — WHISPER_BACKEND=auto falls back to
@@ -17,8 +17,7 @@ faster-whisper==1.2.1
 # Measured on an M2 Air: 2.6x faster than the CPU path.
 mlx-whisper==0.4.3 ; sys_platform == "darwin" and platform_machine == "arm64"
 
-# AMD GPU (Radeon RX 580 / gfx803) path on this `linux` branch: CTranslate2 has
-# no HIP backend, so the GPU engine is openai-whisper running on PyTorch+ROCm.
-# Install a ROCm/HIP build of torch first (see the plan printed by ./run.sh),
-# then this package uses it automatically via WHISPER_BACKEND=auto.
-openai-whisper>=20231117 ; sys_platform == "linux"
+# GPU on Linux (AMD Radeon incl. RX 580/Polaris, Intel, …): whisper.cpp with
+# the Vulkan backend via pywhispercpp. NOT listed here on purpose — the PyPI
+# wheel is CPU-only, so ./run.sh builds it from source with GGML_VULKAN=1
+# (needs cmake, libvulkan-dev, glslc; run.sh installs them via apt).

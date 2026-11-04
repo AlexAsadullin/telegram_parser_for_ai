@@ -36,17 +36,16 @@ DB_PATH: str = str(_resolve(os.getenv("DB_PATH", "backend/history.db")))
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "ru")
 
-# Engine: "auto" prefers a GPU — Apple MLX on M-series, CUDA via
-# faster-whisper/CTranslate2 on NVIDIA, ROCm/HIP on AMD (Radeon RX 580) —
-# and falls back to CPU when nothing usable is found.
-# Force with "mlx" or "faster-whisper".
+# Engine: "auto" prefers a GPU — Apple MLX on M-series, whisper.cpp + Vulkan
+# on AMD/Intel GPUs (incl. Radeon RX 580), CUDA via faster-whisper on NVIDIA —
+# and falls back to faster-whisper on the CPU when nothing usable is found.
+# Force with "mlx", "whispercpp" or "faster-whisper".
 WHISPER_BACKEND: str = os.getenv("WHISPER_BACKEND", "auto")
 
-# Device for the faster-whisper backend. Default "auto" probes the machine at
-# startup (see gpu_detect.py): on this branch the GPU is preferred whenever it
-# answers the probe. Force with "cpu", "cuda" or "rocm" in .env.
+# Device for the faster-whisper engine: "auto" uses CUDA when an NVIDIA GPU is
+# visible, otherwise the CPU. Force with "cpu" or "cuda".
 WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "auto")
-# Compute type override; "auto" picks float16 on GPU, int8 on CPU.
+# Compute type for faster-whisper; "auto" picks float16 on CUDA, int8 on CPU.
 WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
 
 # Messages are pulled and processed in chunks so a long chat never has to fit

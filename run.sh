@@ -8,8 +8,8 @@
 # Ports can be overridden:  BACKEND_PORT=8001 FRONTEND_PORT=5174 ./run.sh
 # Setup only (venv, .env, npm deps, SQLite db), without starting servers:
 #   ./run.sh --setup-only        (alias: SETUP_ONLY=1 ./run.sh)
-# GPU (linux branch): install ROCm + PyTorch(HIP) + openai-whisper for an
-# AMD Radeon automatically (asks for sudo; idempotent):
+# GPU (Linux, AMD/Intel via Vulkan): build whisper.cpp with Vulkan without
+# asking (needs sudo for apt; done once):
 #   ./run.sh --with-gpu         (or just run ./run.sh and answer "y")
 #
 # uvicorn and vite are invoked directly rather than through `npm run` or an
@@ -24,6 +24,7 @@ BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 
 SETUP_ONLY="${SETUP_ONLY:-0}"
+WITH_GPU="${WITH_GPU:-0}"
 
 backend_pid=""
 frontend_pid=""
@@ -76,7 +77,7 @@ port_busy() {
 for arg in "$@"; do
     case "$arg" in
         --setup-only) SETUP_ONLY=1 ;;
-        --with-gpu) : ;;  # handled in the GPU section below
+        --with-gpu) WITH_GPU=1 ;;
         *) die "неизвестный аргумент: $arg (доступны --setup-only, --with-gpu)" ;;
     esac
 done
@@ -131,7 +132,7 @@ fi
 # in .env). Normally the backend creates it on startup; doing it here means the
 # db exists even before the first run and survives without starting servers.
 info "Инициализирую базу данных..."
-if TG_API_ID=dummy TG_API_HASH=dummy venv/bin/python -m backend.init_db >/dev/null 2>&1; then
+if TG_API_ID=0 TG_API_HASH=0 venv/bin/python -m backend.init_db >/dev/null 2>&1; then
     : # ok, dummy credentials are enough just to create the schema
 else
     # Dummy run failed for a real reason (broken venv, bad DB_PATH…) —
@@ -145,88 +146,19 @@ else
 fi
 info "База данных готова: ${_dbmsg}"
 
-# --- GPU (linux branch) ---------------------------------------------------
-# Detect an AMD Radeon (RX 580 / gfx803). If ROCm is missing, run.sh can
-# install it automatically (--with-gpu); otherwise it prints the concrete
-# setup plan instead of silently running on CPU.
+# --- GPU (Linux: whisper.cpp + Vulkan) -------------------------------------
+# AMD cards (incl. Radeon RX 580 / Polaris, which ROCm no longer supports) and
+# other non-NVIDIA GPUs are driven through Mesa's Vulkan driver by whisper.cpp.
+# The PyPI wheel of pywhispercpp is CPU-only, so it is built here from source
+# with GGML_VULKAN=1 (~5 min, once). NVIDIA works through faster-whisper/CUDA
+# and Apple Silicon through MLX, both without this step.
+
+PYWHISPERCPP_VERSION="1.5.1"
+GPU_STAMP="venv/.gpu-vulkan-${PYWHISPERCPP_VERSION}"
+GPU_DECLINED="venv/.gpu-declined"
 
 warn() {
     printf '\033[33mВНИМАНИЕ:\033[0m %s\n' "$1"
-}
-
-amd_gpu_present() {
-    command -v lspci >/dev/null 2>&1 || return 1
-    lspci -nn 2>/dev/null | grep -qiE 'VGA compatible controller.*\[1002:'
-}
-
-rocm_installed() {
-    [ -d /opt/rocm ] && /opt/rocm/bin rocminfo >/dev/null 2>&1
-}
-
-hip_torch_installed() {
-    venv/bin/python - >/dev/null 2>&1 <<'PYEOF'
-import sys
-try:
-    import torch
-except Exception:
-    sys.exit(1)
-sys.exit(0 if getattr(torch.version, "hip", None) else 1)
-PYEOF
-}
-
-ubuntu_codename() {
-    if command -v lsb_release >/dev/null 2>&1; then
-        lsb_release -cs
-    elif [ -r /etc/os-release ]; then
-        . /etc/os-release
-        case "${VERSION_CODENAME:-}" in
-            noble|jammy) echo "$VERSION_CODENAME" ;;
-            *) echo "" ;;
-        esac
-    else
-        echo ""
-    fi
-}
-
-groups_changed=0
-
-add_user_groups() {
-    if id -nG "$USER" | tr ' ' '\n' | grep -qx render && \
-       id -nG "$USER" | tr ' ' '\n' | grep -qx video; then
-        return 0
-    fi
-    info "Добавляю пользователя $USER в группы render,video..."
-    sudo usermod -aG render,video "$USER" \
-        || warn "не удалось добавить в группы — выполните вручную: sudo usermod -aG render,video $USER"
-    groups_changed=1
-}
-
-install_rocm() {
-    local codename deb url tmp
-    command -v lspci >/dev/null 2>&1 || die "не найден lspci (установите пакет pciutils)"
-    command -v sudo >/dev/null 2>&1 || die "для установки ROCm нужен sudo"
-    command -v wget >/dev/null 2>&1 || die "не найден wget (установите: sudo apt install wget)"
-    codename=$(ubuntu_codename)
-    [ -n "$codename" ] || die "автоустановка ROCm поддерживает только Ubuntu 22.04 (jammy) и 24.04 (noble)"
-
-    info "Устанавливаю ROCm для Ubuntu ${codename} (пакет amdgpu-install, ~2 ГБ)..."; 
-    deb="amdgpu-install_6.2.60204-1_all.deb"
-    url="https://repo.radeon.com/amdgpu-install/6.2.4/ubuntu/${codename}/${deb}"
-    tmp="/tmp/${deb}"
-    wget -q --show-progress -O "$tmp" "$url" || die "не скачался amdgpu-install с ${url}"
-    sudo apt install -y "$tmp" || die "не удалось установить ${deb}"
-    sudo amdgpu-install -y --usecase=rocm --no-dkms || die "amdgpu-install завершился неудачей"
-    rm -f "$tmp"
-    add_user_groups
-    info "ROCm установлен."
-}
-
-install_hip_torch() {
-    info "Устанавливаю PyTorch с HIP + openai-whisper в venv (~3–4 ГБ)..."
-    venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm6.2 \
-        openai-whisper "torch>=2.4" torchaudio || die "pip install (rocm6.2) завершился неудачей"
-    touch venv/.deps-installed
-    info "PyTorch/HIP готов."
 }
 
 confirm() {
@@ -236,77 +168,78 @@ confirm() {
     case "${ans,,}" in y|yes) return 0 ;; *) return 1 ;; esac
 }
 
-if amd_gpu_present; then
-    # ./run.sh --with-gpu  →  non-interactive full setup (idempotent).
-    if [ "${1:-}" = "--with-gpu" ]; then
-        rocm_installed || install_rocm
-        hip_torch_installed || install_hip_torch
-        shift
-    fi
+gpu_render_node() {
+    compgen -G '/dev/dri/renderD*' >/dev/null
+}
 
-    if ! rocm_installed; then
-        printf '\n\033[33mНайдена видеокарта AMD, но ROCm не установлен — транскрибация пойдёт на CPU.\033[0m\n'
-        if confirm "Установить ROCm сейчас? Требуется sudo (~2 ГБ)"; then
-            install_rocm
+nvidia_gpu() {
+    grep -qs 0x10de /sys/class/drm/card[0-9]/device/vendor
+}
+
+vulkan_build_installed() {
+    [ -f "$GPU_STAMP" ] && venv/bin/python -c 'import _pywhispercpp' >/dev/null 2>&1
+}
+
+install_vulkan_build_deps() {
+    local need=()
+    command -v cmake >/dev/null 2>&1 || need+=(cmake)
+    command -v glslc >/dev/null 2>&1 || need+=(glslc)
+    command -v g++   >/dev/null 2>&1 || need+=(g++)
+    [ -e /usr/include/vulkan/vulkan.h ] || need+=(libvulkan-dev)
+    compgen -G '/usr/share/vulkan/icd.d/radeon_icd*.json' >/dev/null || need+=(mesa-vulkan-drivers)
+    [ "${#need[@]}" -eq 0 ] && return 0
+
+    if command -v apt-get >/dev/null 2>&1; then
+        info "Устанавливаю пакеты для сборки whisper.cpp с Vulkan: ${need[*]} (нужен sudo)..."
+        sudo apt-get install -y "${need[@]}" || return 1
+    else
+        warn "установите вручную пакеты: ${need[*]} (cmake, glslc, g++, заголовки Vulkan, Mesa Vulkan)"
+        return 1
+    fi
+}
+
+install_vulkan_build() {
+    install_vulkan_build_deps || { warn "не удалось установить пакеты для сборки — остаюсь на CPU"; return 1; }
+    info "Собираю pywhispercpp ${PYWHISPERCPP_VERSION} с Vulkan (~5 минут, только один раз)..."
+    # Static libraries: the from-source wheel cannot carry the libwhisper.so.1
+    # soname symlink, so a shared build fails to import.
+    if GGML_VULKAN=1 \
+       CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DGGML_VULKAN=ON -DGGML_NATIVE=ON" \
+       CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+       venv/bin/pip install --force-reinstall --no-deps --no-binary pywhispercpp --no-cache-dir \
+           "pywhispercpp==${PYWHISPERCPP_VERSION}" \
+       && venv/bin/pip install --quiet "pywhispercpp==${PYWHISPERCPP_VERSION}"; then
+        rm -f venv/.gpu-vulkan-* "$GPU_DECLINED"
+        touch "$GPU_STAMP"
+        info "whisper.cpp + Vulkan установлен."
+    else
+        warn "сборка pywhispercpp не удалась — транскрибация пойдёт на CPU (faster-whisper)"
+        venv/bin/pip uninstall -y -q pywhispercpp >/dev/null 2>&1
+        return 1
+    fi
+}
+
+if [ "$(uname -s)" = "Linux" ] && gpu_render_node && ! nvidia_gpu && ! vulkan_build_installed; then
+    if [ "$WITH_GPU" -eq 1 ]; then
+        install_vulkan_build
+    elif [ ! -f "$GPU_DECLINED" ]; then
+        printf '\n\033[33mНайдена видеокарта, но GPU-движок распознавания ещё не собран — транскрибация пойдёт на CPU.\033[0m\n'
+        if confirm "Собрать whisper.cpp с Vulkan сейчас (sudo для apt, ~5 минут)?"; then
+            install_vulkan_build
         else
-            printf '   Пропускаю. Позже: \033[36m./run.sh --with-gpu\033[0m\n'
-        fi
-    fi
-
-    if rocm_installed && ! hip_torch_installed; then
-        if confirm "Установить PyTorch(HIP) + openai-whisper в venv (~3–4 ГБ)?"; then
-            install_hip_torch
-        else
-            printf '   Пропускаю. Без torch с HIP сборкой GPU использоваться не будет. Команда:\n'
-            printf '     venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm6.2 openai-whisper "torch>=2.4" torchaudio\n'
-        fi
-    fi
-
-    if rocm_installed && hip_torch_installed; then
-        info "GPU-окружение готово (ROCm + torch/HIP)."
-        if [ "$groups_changed" -eq 1 ]; then
-            printf '\n\033[33mГруппы добавлены, но действуют только после перелогина.\033[0m\n'
-            printf 'Проверьте после перезагрузки: \033[36mrocminfo\033[0m (должна быть gfx803), затем снова ./run.sh\n'
-            if ! confirm "Продолжить запуск прямо сейчас (может остаться на CPU)?"; then
-                trap - INT TERM EXIT
-                exit 0
-            fi
+            touch "$GPU_DECLINED"
+            printf '   Пропускаю (больше не спрошу). Позже: \033[36m./run.sh --with-gpu\033[0m\n'
         fi
     fi
 fi
 
-# Print whatever the detector still reports (e.g. vfio-passthrough warning).
-# HSA_OVERRIDE_GFX_VERSION is exported for Polaris cards so the backend (and
-# any ROCm child processes) inherit it without touching ~/.bashrc.
-gpu_env=""
-if amd_gpu_present && grep -qi 'polaris\|rx 5[0-8]0' <<<"$(lspci -nn 2>/dev/null)"; then
-    export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}"
-    export OCL_ENABLE_SYSTEM_SCOPE="${OCL_ENABLE_SYSTEM_SCOPE:-0}"
-    info "Polaris (gfx803): экспортирую HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION для этого запуска"
-    gpu_env="HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION OCL_ENABLE_SYSTEM_SCOPE=$OCL_ENABLE_SYSTEM_SCOPE"
-fi
-gpu_status=$(TG_API_ID=dummy TG_API_HASH=dummy env $gpu_env venv/bin/python -c '
-import sys; sys.path.insert(0, ".")
-from backend import gpu_detect as g
-plan = g.setup_plan()
-kind = plan.get("kind", "")
-print(kind)
-for s in plan.get("steps", []):
-    print("  • " + s)
+# Which engine will actually run (no model is loaded for this).
+asr_status=$(TG_API_ID=0 TG_API_HASH=0 venv/bin/python -c '
+from backend import transcriber as t
+i = t.model_info()
+print(("GPU" if i["gpu"] else "CPU") + ": " + i["backend"] + " на " + i["device"] + ", модель " + i["model"])
 ' 2>/dev/null || true)
-gpu_kind="${gpu_status%%$'\n'*}"
-case "$gpu_kind" in
-    ready)
-        info "GPU готов к транскрибации (ROCm/HIP активен)" ;;
-    setup_required)
-        printf '\n\033[33mТранскрибация пойдёт на CPU. Осталось настроить:\033[0m\n'
-        printf '%s\n' "${gpu_status#*$'\n'}"
-        printf '\033[36mИли выполните: ./run.sh --with-gpu (или перезапустите ./run.sh и согласитесь на установку)\033[0m\n\n' ;;
-    passthrough)
-        printf '\n\033[33m%s\033[0m\n\n' "$(printf '%s' "$gpu_status" | tail -n +2)" ;;
-    no_amd_gpu|*)
-        : ;; # silent when there is no AMD card here
-esac
+[ -n "$asr_status" ] && info "Распознавание речи — $asr_status"
 
 if [ "$SETUP_ONLY" -eq 1 ]; then
     printf '\n\033[32m  Готово.\033[0m  Окружение настроено: venv/, .env, node_modules, база данных.\n'

@@ -72,32 +72,43 @@ BACKEND_PORT=8001 FRONTEND_PORT=5174 ./run.sh    # другие порты
 | Слой | Технологии |
 |---|---|
 | Backend | Python 3.13, FastAPI 0.141, Telethon 1.44, aiosqlite, uvicorn |
-| Распознавание речи | GPU по умолчанию (MLX/CUDA/ROCm) или faster-whisper (CPU), модель `small` |
+| Распознавание речи | GPU по умолчанию (MLX / whisper.cpp+Vulkan / CUDA) или faster-whisper (CPU), модель `small` |
 | Frontend | React 19, Vite 8, Axios |
 | Хранение | JSON / JSONL-файлы + SQLite |
 
 ### Распознавание речи: GPU по умолчанию
 
-Два движка, выбор автоматический (`WHISPER_BACKEND=auto`, `WHISPER_DEVICE=auto`).
-На этой ветке **по умолчанию используется GPU**, если он доступен; CPU — только
-когда сканирование не нашло ничего пригодного (или когда GPU-инициализация
-упала — тогда идёт тихий деград на `cpu int8`, а не падение всей транскрибации).
+Три движка, выбор автоматический (`WHISPER_BACKEND=auto`). **По умолчанию
+используется GPU**, если он доступен; CPU — только когда пригодного GPU нет
+(или его инициализация не удалась — тогда тихий переход на faster-whisper
+`cpu int8`, а не падение всей транскрибации).
 
 | Движок | Устройство | Когда используется |
 |---|---|---|
 | **mlx-whisper** | GPU Apple M-серии | Apple Silicon |
-| **faster-whisper** | CUDA (NVIDIA) | NVIDIA-карты, колёса CTranslate2 из коробки |
-| **faster-whisper** | ROCm/HIP (AMD) | AMD GPU, например Radeon RX 580 (Polaris/gfx803) — требует сборки ctranslate2/torch с ROCm |
-| **faster-whisper** | CPU | Если GPU нет или не подтвердился |
+| **whisper.cpp** (pywhispercpp) | Vulkan | AMD/Intel GPU на Linux, в т.ч. Radeon RX 580 (Polaris) |
+| **faster-whisper** | CUDA | NVIDIA-карты, колёса CTranslate2 из коробки |
+| **faster-whisper** | CPU int8 | Если GPU нет или не подтвердился |
 
-Автоскан (`backend/gpu_detect.py`) выполняется один раз за процесс: сначала
-пробуется CUDA через `ctranslate2.get_cuda_device_count()`, затем ROCm через
-`torch.version.hip`. Результат — `(device, compute_type)`; для GPU берётся
-`float16`, для CPU — `int8`.
+Про AMD Radeon RX 580 (Polaris, gfx803): ROCm эту архитектуру давно не
+поддерживает, и в колёсах PyTorch-ROCm ядер для неё нет — поэтому путь через
+ROCm/torch не работает. Зато Mesa-драйвер RADV поддерживает её через Vulkan,
+и whisper.cpp с Vulkan-бэкендом использует GPU без ROCm. Колесо pywhispercpp с
+PyPI собрано только под CPU, поэтому `./run.sh` один раз собирает его из
+исходников с `GGML_VULKAN=1` (поставит через apt `cmake`, `glslc`,
+`libvulkan-dev`; ~5 минут). Повторить вручную: `./run.sh --with-gpu`.
 
-Про AMD Radeon RX 580: Polaris официально не поддерживается ROCm, но работает
-через форк ROCm-runtime для gfx803 / ZenDNN. Поэтому код и пытается GPU, и
-гарантированно не роняет парсинг, если сборка библиотек не подошла.
+whisper.cpp оставляется, только если он действительно подключился к GPU (это
+видно в его логе при загрузке модели); если Vulkan не нашёл устройство, берётся
+faster-whisper — на CPU он быстрее. Модели whisper.cpp (ggml) кешируются в
+`~/.local/share/pywhispercpp/models`.
+
+Замер на **Radeon RX 580 2048SP**, 46 с русской речи, модель `small`:
+
+| | время | к реальному времени |
+|---|---|---|
+| faster-whisper, CPU int8 | 37 с | ×1.2 |
+| **whisper.cpp, Vulkan (GPU)** | **3.2 с** | **×14** |
 
 Замер на **MacBook Air M2**, 30 с русской речи, модель `small`:
 
@@ -108,8 +119,8 @@ BACKEND_PORT=8001 FRONTEND_PORT=5174 ./run.sh    # другие порты
 
 Какой движок активен, видно в интерфейсе (бейдж под полем ввода) и в `GET /api/asr-model`.
 
-Принудительный выбор: `WHISPER_BACKEND=faster-whisper` или `WHISPER_BACKEND=mlx`;
-устройство — `WHISPER_DEVICE=cpu|cuda|rocm|auto`.
+Принудительный выбор: `WHISPER_BACKEND=mlx|whispercpp|faster-whisper`;
+устройство faster-whisper — `WHISPER_DEVICE=cpu|cuda|auto`.
 
 ### Почему `small`
 
@@ -198,14 +209,14 @@ DATA_DIR=data
 DB_PATH=backend/history.db
 
 # Локальное распознавание речи (личные сообщения). Тоже опционально.
-# auto = предпочитает GPU (MLX/CUDA/ROCm), иначе CPU
+# auto = предпочитает GPU (MLX / whisper.cpp+Vulkan / CUDA), иначе CPU
 WHISPER_BACKEND=auto
 WHISPER_MODEL=small
 WHISPER_LANGUAGE=ru
 
-# auto = автоскан GPU при старте; принудительно cpu | cuda | rocm
+# только faster-whisper: auto = CUDA при наличии NVIDIA; принудительно cpu | cuda
 WHISPER_DEVICE=auto
-# auto = float16 на GPU, int8 на CPU
+# только faster-whisper: auto = float16 на CUDA, int8 на CPU
 WHISPER_COMPUTE_TYPE=auto
 
 # Сколько сообщений обрабатывается за один чанк
@@ -563,7 +574,7 @@ telegram_parser_for_ai/
 │   ├── auth.py         # Вход в Telegram из браузера (код, 2FA)
 │   ├── parser.py       # Telethon: скачивание постов и медиа канала
 │   ├── dialogs.py      # Чанковый парсинг личных сообщений
-│   ├── transcriber.py  # Локальное распознавание речи (faster-whisper)
+│   ├── transcriber.py  # Локальное распознавание речи (MLX / whisper.cpp / faster-whisper)
 │   ├── login.py        # Разовая интерактивная авторизация в Telegram
 │   ├── exporter.py     # Текстовый (.txt) экспорт каналов и переписок
 │   ├── md_export.py    # Markdown-экспорт, самодостаточный для чтения ИИ
